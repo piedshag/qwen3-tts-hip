@@ -4,7 +4,7 @@ set -euo pipefail
 MODE="${1:-quick}"
 ROOT="$(git rev-parse --show-toplevel)"
 MODEL_DIR="${QWEN3_MODEL_DIR:-/home/flynn/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots/85e237c12c027371202489a0ec509ded67b5e4b5}"
-FIXTURE_ROOT="${QWEN3_FIXTURE_ROOT:-/home/flynn/pocket-tts-rs/python-reference/out/custom_voice_0p6b_rocm_long}"
+FIXTURE_ROOT="${QWEN3_FIXTURE_ROOT:-$ROOT/python-reference/out/custom_voice_0p6b_rocm_long}"
 TEXT="${QWEN3_TEXT:-She said she would be here by noon.}"
 PROFILE="${QWEN3_CARGO_PROFILE:-timing}"
 
@@ -21,6 +21,19 @@ case "$MODE" in
     exit 2
     ;;
 esac
+
+if [[ ! -f "$FIXTURE_ROOT/talker_f32_rollout12/rollout_codes.npy" || ! -f "$FIXTURE_ROOT/code_predictor_f32/acoustic_tokens.npy" ]]; then
+  cat >&2 <<EOF
+Missing parity fixtures under:
+  $FIXTURE_ROOT
+
+Generate them with:
+  ./scripts/qwen3-hip-generate-fixtures.sh
+
+Override paths with QWEN3_FIXTURE_ROOT, QWEN3_MODEL_DIR, QWEN3_MODEL, and QWEN3_TTS_PYTHON_SRC.
+EOF
+  exit 1
+fi
 
 cargo check
 

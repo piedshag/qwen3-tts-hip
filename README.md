@@ -48,6 +48,26 @@ speech.write_wav("out.wav", 1.0)?;
 If you need to reserve a fixed KV-cache size independent of `max_frames`, use
 `HipTtsEngine::load_with_options(...)` and set `EngineOptions::max_cache_steps`.
 
+## Python Parity Fixtures
+
+The parity loop is self-contained in this repository. Generate local Python
+reference fixtures with:
+
+```bash
+./scripts/qwen3-hip-generate-fixtures.sh
+```
+
+Then run the fast parity loop:
+
+```bash
+./scripts/qwen3-hip-parity.sh quick
+```
+
+The generated fixture data is written to `python-reference/out/` and is ignored
+by git. The scripts can be pointed at alternate locations with
+`QWEN3_FIXTURE_ROOT`, `QWEN3_MODEL_DIR`, `QWEN3_MODEL`, and
+`QWEN3_TTS_PYTHON_SRC`.
+
 Smoke test:
 
 ```bash

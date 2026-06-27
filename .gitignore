@@ -1,4 +1,6 @@
 /target/
+/python-reference/.venv/
+/python-reference/out/
 **/*.wav
 *.profraw
 *.profdata
