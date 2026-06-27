@@ -18,6 +18,36 @@ Current scope:
 - Provides smoke tests for HIP runtime, rocBLAS SGEMM, RMSNorm, RoPE, HIP Graphs,
   and persistent Qwen decoder decode-step execution.
 
+## Generation API
+
+Use `HipTtsEngine` for the public text-to-speech interface. The lower-level
+`gpu`, `model`, and `audio` modules remain available for diagnostics and parity
+tests, but ordinary callers should not need to assemble the talker,
+CodePredictor, and codec manually.
+
+```rust,no_run
+use qwen3_hip_runtime::{GenerateOptions, HipTtsEngine, Language, Speaker};
+
+# fn main() -> qwen3_hip_runtime::Result<()> {
+let engine = HipTtsEngine::load_with_max_frames("/path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice", 0, 240)?;
+let speech = engine.generate(
+    "She said she would be here by noon.",
+    GenerateOptions {
+        speaker: Speaker::Ryan,
+        language: Language::English,
+        max_frames: 240,
+        decode_audio: true,
+    },
+)?;
+
+speech.write_wav("out.wav", 1.0)?;
+# Ok(())
+# }
+```
+
+If you need to reserve a fixed KV-cache size independent of `max_frames`, use
+`HipTtsEngine::load_with_options(...)` and set `EngineOptions::max_cache_steps`.
+
 Smoke test:
 
 ```bash

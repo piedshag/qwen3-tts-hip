@@ -1,22 +1,17 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_hip_runtime::code_predictor::HipCodePredictor;
-use qwen3_hip_runtime::codec::write_wav;
-use qwen3_hip_runtime::codec_hip::HipCodecInitial;
-use qwen3_hip_runtime::talker::HipTalker;
-use qwen3_hip_runtime::text::{CustomVoiceTextPrep, Language, Speaker};
-use qwen3_hip_runtime::{DeviceBuffer, Error, HipRuntime};
+use qwen3_hip_runtime::generation::{GenerateOptions, HipTtsEngine, Language, Speaker};
+use qwen3_hip_runtime::{Error, Result};
 
 const CODE_GROUPS: usize = 16;
-const CODEC_EOS_TOKEN: i32 = 2150;
 
 struct NpyF32 {
     shape: Vec<usize>,
     data: Vec<f32>,
 }
 
-fn main() -> qwen3_hip_runtime::Result<()> {
+fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model_dir = args.next().map(PathBuf::from).unwrap_or_else(|| {
         PathBuf::from("/home/flynn/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots/85e237c12c027371202489a0ec509ded67b5e4b5")
@@ -48,145 +43,52 @@ fn main() -> qwen3_hip_runtime::Result<()> {
         ));
     }
 
-    let prep = CustomVoiceTextPrep::load(&model_dir)?;
-    let inputs = prep.prepare_custom_voice(&text, speaker, language)?;
-    let runtime = HipRuntime::new(0)?;
-    let talker = HipTalker::load(&runtime, &model_dir, inputs.prefill_steps + max_frames)?;
-    let predictor = HipCodePredictor::load(&runtime, &model_dir)?;
-    if predictor.talker_hidden() != talker.hidden_size() {
-        return Err(Error::InvalidInput(format!(
-            "CodePredictor talker hidden {} does not match talker hidden {}",
-            predictor.talker_hidden(),
-            talker.hidden_size()
-        )));
-    }
-    let hidden = talker.hidden_size();
-    let prefill = runtime.buffer_from_slice(&inputs.prefill)?;
-    let trailing = upload_trailing(
-        &runtime,
-        &inputs.trailing_text,
-        &inputs.tts_pad_embed,
-        max_frames.saturating_sub(1),
-        hidden,
+    let engine = HipTtsEngine::load_with_max_frames(&model_dir, 0, max_frames)?;
+    let speech = engine.generate(
+        &text,
+        GenerateOptions {
+            speaker,
+            language,
+            max_frames,
+            decode_audio: output_wav.is_some(),
+        },
     )?;
-    let cp_prefix = runtime.empty_buffer::<f32>(2 * hidden)?;
-    let acoustic_sum = runtime.empty_buffer::<f32>(hidden)?;
-
-    let (frames, ended_by_eos) = rollout(
-        &talker,
-        &predictor,
-        &prefill,
-        &cp_prefix,
-        &acoustic_sum,
-        &trailing,
-        inputs.prefill_steps,
-        max_frames,
-    )?;
-    runtime.synchronize()?;
 
     if let Some(path) = reference_codes.as_deref() {
         let expected = load_expected_codes(path)?;
-        if expected.len() < frames.len() {
+        if expected.len() < speech.codes.len() {
             return Err(Error::InvalidInput(format!(
                 "reference has {} codes but generated {}",
                 expected.len(),
-                frames.len()
+                speech.codes.len()
             )));
         }
-        if frames != expected[..frames.len()] {
+        if speech.codes != expected[..speech.codes.len()] {
             return Err(Error::InvalidInput(format!(
-                "generated codes mismatch: actual={frames:?}, expected={:?}",
-                &expected[..frames.len()]
+                "generated codes mismatch: actual={:?}, expected={:?}",
+                speech.codes,
+                &expected[..speech.codes.len()]
             )));
         }
     }
 
     if let Some(path) = output_wav.as_deref() {
-        let decoder = HipCodecInitial::load(&runtime, &model_dir)?;
-        let waveform = decode_waveform(&runtime, &decoder, &frames)?;
-        write_wav(path, &waveform, 24_000, wav_gain)?;
+        speech.write_wav(path, wav_gain)?;
     }
 
     println!(
-        "HIP custom voice generate OK: text={text:?}, speaker={speaker:?}, language={language:?}, input_tokens={}, content_tokens={}, prefill_steps={}, trailing_steps={}, frames={}, ended_by_eos={ended_by_eos}, output_wav={:?}, first_frame={:?}, last_frame={:?}",
-        inputs.input_ids.len(),
-        inputs.content_ids.len(),
-        inputs.prefill_steps,
-        inputs.trailing_steps,
-        frames.len() / CODE_GROUPS,
+        "HIP custom voice generate OK: text={text:?}, speaker={speaker:?}, language={language:?}, frames={}, ended_by_eos={}, samples={}, output_wav={:?}, first_frame={:?}, last_frame={:?}",
+        speech.frames,
+        speech.ended_by_eos,
+        speech.samples.len(),
         output_wav,
-        &frames[..CODE_GROUPS.min(frames.len())],
-        &frames[frames.len().saturating_sub(CODE_GROUPS)..]
+        &speech.codes[..CODE_GROUPS.min(speech.codes.len())],
+        &speech.codes[speech.codes.len().saturating_sub(CODE_GROUPS)..]
     );
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rollout(
-    talker: &HipTalker,
-    predictor: &HipCodePredictor,
-    prefill: &DeviceBuffer<f32>,
-    cp_prefix: &DeviceBuffer<f32>,
-    acoustic_sum: &DeviceBuffer<f32>,
-    trailing: &[DeviceBuffer<f32>],
-    prefill_steps: usize,
-    max_frames: usize,
-) -> qwen3_hip_runtime::Result<(Vec<i32>, bool)> {
-    let mut semantic = talker.prefill_token(prefill, prefill_steps)?;
-    let mut generated = Vec::with_capacity(max_frames * CODE_GROUPS);
-    let mut ended_by_eos = false;
-    for frame in 0..max_frames {
-        if semantic == CODEC_EOS_TOKEN {
-            ended_by_eos = true;
-            break;
-        }
-        talker.prepare_code_predictor_prefix(cp_prefix)?;
-        let acoustic = predictor.generate_to_buffer(cp_prefix, acoustic_sum)?;
-        generated.push(semantic);
-        generated.extend(acoustic);
-        if frame + 1 < max_frames {
-            talker.build_step_input(acoustic_sum, &trailing[frame])?;
-            semantic = talker.decode_prepared_token(prefill_steps + frame)?;
-        }
-    }
-    Ok((generated, ended_by_eos))
-}
-
-fn decode_waveform(
-    runtime: &HipRuntime,
-    decoder: &HipCodecInitial,
-    codes: &[i32],
-) -> qwen3_hip_runtime::Result<Vec<f32>> {
-    let frames = codes.len() / CODE_GROUPS;
-    let initial = decoder.run(runtime, codes, frames)?;
-    let pre_transformer =
-        decoder.run_pre_transformer(runtime, &initial.pre_conv, initial.frames)?;
-    let upsample = decoder.run_upsample_stages(runtime, &pre_transformer, initial.frames)?;
-    let output = decoder.run_decoder_stages(runtime, &upsample.upsample_1_1, upsample.frames_1)?;
-    runtime.synchronize()?;
-    output.waveform.copy_to_host()
-}
-
-fn upload_trailing(
-    runtime: &HipRuntime,
-    trailing: &[f32],
-    tts_pad: &[f32],
-    frames: usize,
-    hidden: usize,
-) -> qwen3_hip_runtime::Result<Vec<DeviceBuffer<f32>>> {
-    let mut buffers = Vec::with_capacity(frames);
-    for frame in 0..frames {
-        let offset = frame * hidden;
-        if offset + hidden <= trailing.len() {
-            buffers.push(runtime.buffer_from_slice(&trailing[offset..offset + hidden])?);
-        } else {
-            buffers.push(runtime.buffer_from_slice(tts_pad)?);
-        }
-    }
-    Ok(buffers)
-}
-
-fn load_expected_codes(path: &Path) -> qwen3_hip_runtime::Result<Vec<i32>> {
+fn load_expected_codes(path: &Path) -> Result<Vec<i32>> {
     let npy = read_npy_f32(path).map_err(|err| Error::InvalidInput(err.to_string()))?;
     if npy.shape.len() != 2 || npy.shape[1] != CODE_GROUPS {
         return Err(Error::InvalidInput(format!(
@@ -197,10 +99,7 @@ fn load_expected_codes(path: &Path) -> qwen3_hip_runtime::Result<Vec<i32>> {
     Ok(npy.data.iter().map(|value| value.round() as i32).collect())
 }
 
-fn parse_arg(
-    value: Option<std::ffi::OsString>,
-    name: &str,
-) -> qwen3_hip_runtime::Result<Option<usize>> {
+fn parse_arg(value: Option<std::ffi::OsString>, name: &str) -> Result<Option<usize>> {
     value
         .map(|value| {
             value
@@ -211,10 +110,7 @@ fn parse_arg(
         .transpose()
 }
 
-fn parse_f32_arg(
-    value: Option<std::ffi::OsString>,
-    name: &str,
-) -> qwen3_hip_runtime::Result<Option<f32>> {
+fn parse_f32_arg(value: Option<std::ffi::OsString>, name: &str) -> Result<Option<f32>> {
     value
         .map(|value| {
             value
@@ -225,7 +121,7 @@ fn parse_f32_arg(
         .transpose()
 }
 
-fn read_npy_f32(path: &Path) -> Result<NpyF32, Box<dyn std::error::Error>> {
+fn read_npy_f32(path: &Path) -> std::result::Result<NpyF32, Box<dyn std::error::Error>> {
     let bytes = fs::read(path)?;
     if bytes.len() < 10 || &bytes[0..6] != b"\x93NUMPY" {
         return Err(format!("{} is not a .npy file", path.display()).into());
@@ -257,7 +153,7 @@ fn read_npy_f32(path: &Path) -> Result<NpyF32, Box<dyn std::error::Error>> {
     Ok(NpyF32 { shape, data })
 }
 
-fn parse_shape(header: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+fn parse_shape(header: &str) -> std::result::Result<Vec<usize>, Box<dyn std::error::Error>> {
     let shape_key = header
         .find("'shape':")
         .or_else(|| header.find("\"shape\":"))
@@ -277,6 +173,6 @@ fn parse_shape(header: &str) -> Result<Vec<usize>, Box<dyn std::error::Error>> {
             (!trimmed.is_empty()).then_some(trimmed)
         })
         .map(str::parse::<usize>)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(shape)
 }

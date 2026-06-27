@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod error;
+pub mod generation;
 pub mod gpu;
 pub mod model;
 
@@ -70,6 +71,10 @@ pub mod weights {
 pub use blas::RocblasHandle;
 pub use buffer::DeviceBuffer;
 pub use error::{Error, Result};
+pub use generation::{
+    EngineOptions, GenerateOptions, GeneratedCodes, GeneratedSpeech, HipTtsEngine, Language,
+    Speaker,
+};
 pub use graph::{HipGraph, HipGraphExec, HipStream};
 pub use kernel::{HipFunction, HipModule};
 pub use runtime::HipRuntime;
