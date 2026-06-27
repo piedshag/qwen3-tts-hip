@@ -5,6 +5,7 @@ use safetensors::tensor::TensorView;
 
 use crate::blas::RocblasHandle;
 use crate::buffer::DeviceBuffer;
+use crate::config::Qwen3TtsConfig;
 use crate::decode::DecodeStepStack;
 use crate::error::{Error, Result};
 use crate::kernel::{HipFunction, HipModule};
@@ -15,10 +16,6 @@ use crate::kernels::{
 use crate::runtime::HipRuntime;
 use crate::weights::{TensorArchive, tensor_to_f32};
 
-const TALKER_HIDDEN: usize = 1024;
-const TALKER_VOCAB: usize = 3072;
-const CODEC_EOS_TOKEN: usize = 2150;
-
 pub struct TalkerPrefillOutput {
     pub hidden: Vec<f32>,
     pub logits: Vec<f32>,
@@ -27,6 +24,10 @@ pub struct TalkerPrefillOutput {
 }
 
 pub struct HipTalker {
+    hidden_size: usize,
+    vocab_size: usize,
+    codec_eos_token: usize,
+    epsilon: f32,
     stack: DecodeStepStack,
     blas: RocblasHandle,
     kernels: TalkerKernels,
@@ -58,32 +59,45 @@ struct TalkerKernels {
 
 impl HipTalker {
     pub fn load(runtime: &HipRuntime, model_dir: &Path, max_cache_steps: usize) -> Result<Self> {
+        let config = Qwen3TtsConfig::load(model_dir)?;
         let stack = DecodeStepStack::load_with_prefix(
             runtime,
             model_dir,
             "talker.model.layers",
-            28,
+            config.talker.layers,
             max_cache_steps,
-            1e-6,
-            1_000_000.0,
+            config.talker.rms_eps,
+            config.talker.rope_theta,
         )?;
         let dims = stack.dims();
-        if dims.hidden != TALKER_HIDDEN {
+        if dims.hidden != config.talker.hidden {
             return Err(Error::InvalidInput(format!(
-                "talker hidden {} does not match expected {TALKER_HIDDEN}",
-                dims.hidden
+                "talker hidden {} does not match config hidden {}",
+                dims.hidden, config.talker.hidden
             )));
         }
+        if dims.intermediate != config.talker.intermediate
+            || dims.q_heads != config.talker.q_heads
+            || dims.kv_heads != config.talker.kv_heads
+            || dims.head_dim != config.talker.head_dim
+        {
+            return Err(Error::InvalidInput(format!(
+                "talker stack dims {:?} do not match config {:?}",
+                dims, config.talker
+            )));
+        }
+        let hidden_size = config.talker.hidden;
+        let vocab_size = config.talker.vocab;
         let archive = TensorArchive::open(&model_dir.join("model.safetensors"))?;
         let norm_gamma = archive.vector_f32("talker.model.norm.weight")?;
         let (codec_head, head_in, vocab) =
             archive.linear_weight_transposed_f32("talker.codec_head.weight")?;
         let codec_embedding = embedding_table_f32(
             archive.tensor("talker.model.codec_embedding.weight")?,
-            TALKER_VOCAB,
-            TALKER_HIDDEN,
+            vocab_size,
+            hidden_size,
         )?;
-        if norm_gamma.len() != TALKER_HIDDEN || head_in != TALKER_HIDDEN || vocab != TALKER_VOCAB {
+        if norm_gamma.len() != hidden_size || head_in != hidden_size || vocab != vocab_size {
             return Err(Error::InvalidInput(format!(
                 "invalid talker head shapes: norm={}, head_in={head_in}, vocab={vocab}",
                 norm_gamma.len()
@@ -91,21 +105,33 @@ impl HipTalker {
         }
 
         Ok(Self {
+            hidden_size,
+            vocab_size,
+            codec_eos_token: config.tokens.codec_eos,
+            epsilon: config.talker.rms_eps,
             stack,
             blas: runtime.create_blas_handle()?,
             kernels: TalkerKernels::compile(runtime)?,
             norm_gamma: runtime.buffer_from_slice(&norm_gamma)?,
             codec_head: runtime.buffer_from_slice(&codec_head)?,
             codec_embedding: runtime.buffer_from_slice(&codec_embedding)?,
-            pre_norm: runtime.empty_buffer::<f32>(TALKER_HIDDEN)?,
-            hidden: runtime.empty_buffer::<f32>(TALKER_HIDDEN)?,
-            logits: runtime.empty_buffer::<f32>(TALKER_VOCAB)?,
-            suppressed_logits: runtime.empty_buffer::<f32>(TALKER_VOCAB)?,
+            pre_norm: runtime.empty_buffer::<f32>(hidden_size)?,
+            hidden: runtime.empty_buffer::<f32>(hidden_size)?,
+            logits: runtime.empty_buffer::<f32>(vocab_size)?,
+            suppressed_logits: runtime.empty_buffer::<f32>(vocab_size)?,
             token: runtime.empty_buffer::<i32>(1)?,
-            semantic_embedding: runtime.empty_buffer::<f32>(TALKER_HIDDEN)?,
-            step_temp: runtime.empty_buffer::<f32>(TALKER_HIDDEN)?,
-            step_input: runtime.empty_buffer::<f32>(TALKER_HIDDEN)?,
+            semantic_embedding: runtime.empty_buffer::<f32>(hidden_size)?,
+            step_temp: runtime.empty_buffer::<f32>(hidden_size)?,
+            step_input: runtime.empty_buffer::<f32>(hidden_size)?,
         })
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
     }
 
     pub fn prefill_from_host(
@@ -114,11 +140,11 @@ impl HipTalker {
         prefill: &[f32],
         steps: usize,
     ) -> Result<TalkerPrefillOutput> {
-        if prefill.len() != steps * TALKER_HIDDEN {
+        if prefill.len() != steps * self.hidden_size {
             return Err(Error::InvalidInput(format!(
                 "prefill length {} does not match steps*hidden {}",
                 prefill.len(),
-                steps * TALKER_HIDDEN
+                steps * self.hidden_size
             )));
         }
         let prefill = runtime.buffer_from_slice(prefill)?;
@@ -142,28 +168,29 @@ impl HipTalker {
             self.pre_norm.as_ptr(),
             self.norm_gamma.as_ptr(),
             self.hidden.as_mut_ptr(),
-            TALKER_HIDDEN,
+            self.hidden_size,
+            self.epsilon,
         )?;
         self.blas.sgemm_row_major(
             &self.hidden,
             &self.codec_head,
             &self.logits,
             1,
-            TALKER_VOCAB,
-            TALKER_HIDDEN,
+            self.vocab_size,
+            self.hidden_size,
         )?;
         launch_suppress(
             &self.kernels.suppress,
             &self.logits,
             &self.suppressed_logits,
-            TALKER_VOCAB,
-            CODEC_EOS_TOKEN,
+            self.vocab_size,
+            self.codec_eos_token,
         )?;
         launch_argmax(
             &self.kernels.argmax,
             &self.suppressed_logits,
             &self.token,
-            TALKER_VOCAB,
+            self.vocab_size,
         )?;
         let token = self.token.copy_to_host()?[0];
         Ok(TalkerPrefillOutput {
@@ -191,10 +218,11 @@ impl HipTalker {
         input: &[f32],
         offset: usize,
     ) -> Result<TalkerPrefillOutput> {
-        if input.len() != TALKER_HIDDEN {
+        if input.len() != self.hidden_size {
             return Err(Error::InvalidInput(format!(
-                "decode input length {} does not match hidden {TALKER_HIDDEN}",
-                input.len()
+                "decode input length {} does not match hidden {}",
+                input.len(),
+                self.hidden_size
             )));
         }
         let input = runtime.buffer_from_slice(input)?;
@@ -212,28 +240,29 @@ impl HipTalker {
             self.pre_norm.as_ptr(),
             self.norm_gamma.as_ptr(),
             self.hidden.as_mut_ptr(),
-            TALKER_HIDDEN,
+            self.hidden_size,
+            self.epsilon,
         )?;
         self.blas.sgemm_row_major(
             &self.hidden,
             &self.codec_head,
             &self.logits,
             1,
-            TALKER_VOCAB,
-            TALKER_HIDDEN,
+            self.vocab_size,
+            self.hidden_size,
         )?;
         launch_suppress(
             &self.kernels.suppress,
             &self.logits,
             &self.suppressed_logits,
-            TALKER_VOCAB,
-            CODEC_EOS_TOKEN,
+            self.vocab_size,
+            self.codec_eos_token,
         )?;
         launch_argmax(
             &self.kernels.argmax,
             &self.suppressed_logits,
             &self.token,
-            TALKER_VOCAB,
+            self.vocab_size,
         )?;
         let token = self.token.copy_to_host()?[0];
         Ok(TalkerPrefillOutput {
@@ -245,10 +274,10 @@ impl HipTalker {
     }
 
     pub fn prepare_code_predictor_prefix(&self, output: &DeviceBuffer<f32>) -> Result<()> {
-        if output.len() != 2 * TALKER_HIDDEN {
+        if output.len() != 2 * self.hidden_size {
             return Err(Error::InvalidInput(format!(
                 "CodePredictor prefix output length must be {}, got {}",
-                2 * TALKER_HIDDEN,
+                2 * self.hidden_size,
                 output.len()
             )));
         }
@@ -257,10 +286,15 @@ impl HipTalker {
             &self.codec_embedding,
             &self.token,
             &self.semantic_embedding,
-            TALKER_HIDDEN,
+            self.hidden_size,
         )?;
-        output.copy_from_device_range_at(0, &self.hidden, 0, TALKER_HIDDEN)?;
-        output.copy_from_device_range_at(TALKER_HIDDEN, &self.semantic_embedding, 0, TALKER_HIDDEN)
+        output.copy_from_device_range_at(0, &self.hidden, 0, self.hidden_size)?;
+        output.copy_from_device_range_at(
+            self.hidden_size,
+            &self.semantic_embedding,
+            0,
+            self.hidden_size,
+        )
     }
 
     pub fn build_step_input(
@@ -268,9 +302,12 @@ impl HipTalker {
         acoustic_embedding_sum: &DeviceBuffer<f32>,
         trailing_text: &DeviceBuffer<f32>,
     ) -> Result<()> {
-        if acoustic_embedding_sum.len() != TALKER_HIDDEN || trailing_text.len() != TALKER_HIDDEN {
+        if acoustic_embedding_sum.len() != self.hidden_size
+            || trailing_text.len() != self.hidden_size
+        {
             return Err(Error::InvalidInput(format!(
-                "step input parts must have length {TALKER_HIDDEN}, got acoustic={}, trailing={}",
+                "step input parts must have length {}, got acoustic={}, trailing={}",
+                self.hidden_size,
                 acoustic_embedding_sum.len(),
                 trailing_text.len()
             )));
@@ -280,21 +317,21 @@ impl HipTalker {
             &self.codec_embedding,
             &self.token,
             &self.semantic_embedding,
-            TALKER_HIDDEN,
+            self.hidden_size,
         )?;
         launch_residual_add(
             &self.kernels.residual_add,
             self.semantic_embedding.as_ptr(),
             acoustic_embedding_sum.as_ptr(),
             self.step_temp.as_mut_ptr(),
-            TALKER_HIDDEN,
+            self.hidden_size,
         )?;
         launch_residual_add(
             &self.kernels.residual_add,
             self.step_temp.as_ptr(),
             trailing_text.as_ptr(),
             self.step_input.as_mut_ptr(),
-            TALKER_HIDDEN,
+            self.hidden_size,
         )
     }
 
@@ -314,28 +351,29 @@ impl HipTalker {
             self.pre_norm.as_ptr(),
             self.norm_gamma.as_ptr(),
             self.hidden.as_mut_ptr(),
-            TALKER_HIDDEN,
+            self.hidden_size,
+            self.epsilon,
         )?;
         self.blas.sgemm_row_major(
             &self.hidden,
             &self.codec_head,
             &self.logits,
             1,
-            TALKER_VOCAB,
-            TALKER_HIDDEN,
+            self.vocab_size,
+            self.hidden_size,
         )?;
         launch_suppress(
             &self.kernels.suppress,
             &self.logits,
             &self.suppressed_logits,
-            TALKER_VOCAB,
-            CODEC_EOS_TOKEN,
+            self.vocab_size,
+            self.codec_eos_token,
         )?;
         launch_argmax(
             &self.kernels.argmax,
             &self.suppressed_logits,
             &self.token,
-            TALKER_VOCAB,
+            self.vocab_size,
         )?;
         Ok(self.token.copy_to_host()?[0])
     }
@@ -391,13 +429,14 @@ fn launch_rmsnorm(
     gamma: *const c_void,
     output: *mut c_void,
     cols: usize,
+    epsilon: f32,
 ) -> Result<()> {
     let mut input = input;
     let mut gamma = gamma;
     let mut output = output;
     let mut rows_i32 = 1i32;
     let mut cols_i32 = cols as i32;
-    let mut epsilon = 1e-6f32;
+    let mut epsilon = epsilon;
     let mut params = [
         &mut input as *mut *const c_void as *mut c_void,
         &mut gamma as *mut *const c_void as *mut c_void,

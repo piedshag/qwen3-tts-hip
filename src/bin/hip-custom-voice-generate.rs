@@ -8,7 +8,6 @@ use qwen3_hip_runtime::talker::HipTalker;
 use qwen3_hip_runtime::text::{CustomVoiceTextPrep, Language, Speaker};
 use qwen3_hip_runtime::{DeviceBuffer, Error, HipRuntime};
 
-const HIDDEN: usize = 1024;
 const CODE_GROUPS: usize = 16;
 const CODEC_EOS_TOKEN: i32 = 2150;
 
@@ -27,7 +26,10 @@ fn main() -> qwen3_hip_runtime::Result<()> {
         .map(|value| value.to_string_lossy().into_owned())
         .unwrap_or_else(|| "She said she would be here by noon.".to_string());
     let max_frames = parse_arg(args.next(), "max_frames")?.unwrap_or(12);
-    let reference_codes = args.next().map(PathBuf::from);
+    let reference_codes = args.next().and_then(|value| {
+        let text = value.to_string_lossy();
+        (!matches!(text.as_ref(), "none" | "-")).then(|| PathBuf::from(value))
+    });
     let speaker = args
         .next()
         .map(|value| value.to_string_lossy().parse::<Speaker>())
@@ -51,17 +53,26 @@ fn main() -> qwen3_hip_runtime::Result<()> {
     let runtime = HipRuntime::new(0)?;
     let talker = HipTalker::load(&runtime, &model_dir, inputs.prefill_steps + max_frames)?;
     let predictor = HipCodePredictor::load(&runtime, &model_dir)?;
+    if predictor.talker_hidden() != talker.hidden_size() {
+        return Err(Error::InvalidInput(format!(
+            "CodePredictor talker hidden {} does not match talker hidden {}",
+            predictor.talker_hidden(),
+            talker.hidden_size()
+        )));
+    }
+    let hidden = talker.hidden_size();
     let prefill = runtime.buffer_from_slice(&inputs.prefill)?;
     let trailing = upload_trailing(
         &runtime,
         &inputs.trailing_text,
         &inputs.tts_pad_embed,
         max_frames.saturating_sub(1),
+        hidden,
     )?;
-    let cp_prefix = runtime.empty_buffer::<f32>(2 * HIDDEN)?;
-    let acoustic_sum = runtime.empty_buffer::<f32>(HIDDEN)?;
+    let cp_prefix = runtime.empty_buffer::<f32>(2 * hidden)?;
+    let acoustic_sum = runtime.empty_buffer::<f32>(hidden)?;
 
-    let frames = rollout(
+    let (frames, ended_by_eos) = rollout(
         &talker,
         &predictor,
         &prefill,
@@ -97,7 +108,7 @@ fn main() -> qwen3_hip_runtime::Result<()> {
     }
 
     println!(
-        "HIP custom voice generate OK: text={text:?}, speaker={speaker:?}, language={language:?}, input_tokens={}, content_tokens={}, prefill_steps={}, trailing_steps={}, frames={}, output_wav={:?}, first_frame={:?}, last_frame={:?}",
+        "HIP custom voice generate OK: text={text:?}, speaker={speaker:?}, language={language:?}, input_tokens={}, content_tokens={}, prefill_steps={}, trailing_steps={}, frames={}, ended_by_eos={ended_by_eos}, output_wav={:?}, first_frame={:?}, last_frame={:?}",
         inputs.input_ids.len(),
         inputs.content_ids.len(),
         inputs.prefill_steps,
@@ -120,11 +131,13 @@ fn rollout(
     trailing: &[DeviceBuffer<f32>],
     prefill_steps: usize,
     max_frames: usize,
-) -> qwen3_hip_runtime::Result<Vec<i32>> {
+) -> qwen3_hip_runtime::Result<(Vec<i32>, bool)> {
     let mut semantic = talker.prefill_token(prefill, prefill_steps)?;
     let mut generated = Vec::with_capacity(max_frames * CODE_GROUPS);
+    let mut ended_by_eos = false;
     for frame in 0..max_frames {
         if semantic == CODEC_EOS_TOKEN {
+            ended_by_eos = true;
             break;
         }
         talker.prepare_code_predictor_prefix(cp_prefix)?;
@@ -136,7 +149,7 @@ fn rollout(
             semantic = talker.decode_prepared_token(prefill_steps + frame)?;
         }
     }
-    Ok(generated)
+    Ok((generated, ended_by_eos))
 }
 
 fn decode_waveform(
@@ -159,12 +172,13 @@ fn upload_trailing(
     trailing: &[f32],
     tts_pad: &[f32],
     frames: usize,
+    hidden: usize,
 ) -> qwen3_hip_runtime::Result<Vec<DeviceBuffer<f32>>> {
     let mut buffers = Vec::with_capacity(frames);
     for frame in 0..frames {
-        let offset = frame * HIDDEN;
-        if offset + HIDDEN <= trailing.len() {
-            buffers.push(runtime.buffer_from_slice(&trailing[offset..offset + HIDDEN])?);
+        let offset = frame * hidden;
+        if offset + hidden <= trailing.len() {
+            buffers.push(runtime.buffer_from_slice(&trailing[offset..offset + hidden])?);
         } else {
             buffers.push(runtime.buffer_from_slice(tts_pad)?);
         }

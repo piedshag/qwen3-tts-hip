@@ -89,6 +89,20 @@ extern "C" __global__ void residual_add_f32(
     }
 }
 
+extern "C" __global__ void bias_add_f32(
+    const float* input,
+    const float* bias,
+    float* output,
+    int rows,
+    int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * cols;
+    if (idx < total) {
+        output[idx] = input[idx] + bias[idx % cols];
+    }
+}
+
 extern "C" __global__ void swiglu_f32(
     const float* gate,
     const float* up,

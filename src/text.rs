@@ -7,26 +7,11 @@ use tokenizers::models::bpe::BPE;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::{AddedToken, Tokenizer};
 
+use crate::config::Qwen3TtsConfig;
 use crate::error::{Error, Result};
 use crate::weights::{TensorArchive, read_value, tensor_to_f32};
 
-const TEXT_EMBED_DIM: usize = 2048;
-const HIDDEN: usize = 1024;
-const TEXT_PROJ_INTERMEDIATE: usize = 2048;
-
-const IM_START: u32 = 151644;
-const ASSISTANT: u32 = 77091;
 const NEWLINE: u32 = 198;
-
-const TTS_PAD: u32 = 151671;
-const TTS_BOS: u32 = 151672;
-const TTS_EOS: u32 = 151673;
-
-const CODEC_PAD: u32 = 2148;
-const CODEC_BOS: u32 = 2149;
-const CODEC_THINK: u32 = 2154;
-const CODEC_THINK_BOS: u32 = 2156;
-const CODEC_THINK_EOS: u32 = 2157;
 
 #[derive(Debug, Clone)]
 pub struct CustomVoiceInputs {
@@ -66,6 +51,21 @@ impl Language {
             Self::Portuguese => 2071,
             Self::Spanish => 2054,
             Self::Italian => 2070,
+        }
+    }
+
+    fn config_key(self) -> &'static str {
+        match self {
+            Self::Chinese => "chinese",
+            Self::English => "english",
+            Self::Japanese => "japanese",
+            Self::Korean => "korean",
+            Self::German => "german",
+            Self::French => "french",
+            Self::Russian => "russian",
+            Self::Portuguese => "portuguese",
+            Self::Spanish => "spanish",
+            Self::Italian => "italian",
         }
     }
 }
@@ -115,6 +115,20 @@ impl Speaker {
             Self::Sohee => 2864,
             Self::Eric => 2875,
             Self::Dylan => 2878,
+        }
+    }
+
+    fn config_key(self) -> &'static str {
+        match self {
+            Self::Serena => "serena",
+            Self::Vivian => "vivian",
+            Self::UncleFu => "uncle_fu",
+            Self::Ryan => "ryan",
+            Self::Aiden => "aiden",
+            Self::OnoAnna => "ono_anna",
+            Self::Sohee => "sohee",
+            Self::Eric => "eric",
+            Self::Dylan => "dylan",
         }
     }
 }
@@ -232,10 +246,14 @@ impl TextTokenizer {
 }
 
 pub struct CustomVoiceTextPrep {
+    config: Qwen3TtsConfig,
     tokenizer: TextTokenizer,
     text_embedding_dtype: Dtype,
     text_embedding_data: Vec<u8>,
     text_vocab: usize,
+    text_embed_dim: usize,
+    hidden: usize,
+    text_proj_intermediate: usize,
     fc1_weight: Vec<f32>,
     fc1_bias: Vec<f32>,
     fc2_weight: Vec<f32>,
@@ -246,17 +264,19 @@ pub struct CustomVoiceTextPrep {
 
 impl CustomVoiceTextPrep {
     pub fn load(model_dir: &Path) -> Result<Self> {
+        let config = Qwen3TtsConfig::load(model_dir)?;
         let tokenizer = TextTokenizer::from_pretrained(model_dir)?;
         let archive = TensorArchive::open(&model_dir.join("model.safetensors"))?;
         archive.with_tensors(|tensors| {
             let text_embedding_tensor = tensors.tensor("talker.model.text_embedding.weight")
                 .map_err(|err| Error::InvalidInput(format!("failed to load talker.model.text_embedding.weight: {err}")))?;
             let text_shape = text_embedding_tensor.shape();
-            if text_shape.len() != 2 || text_shape[1] != TEXT_EMBED_DIM {
+            if text_shape.len() != 2 || text_shape[1] != config.talker.hidden && text_shape[1] != 2048 {
                 return Err(Error::InvalidInput(format!(
-                    "talker.model.text_embedding.weight shape {text_shape:?}; expected [vocab, {TEXT_EMBED_DIM}]"
+                    "talker.model.text_embedding.weight shape {text_shape:?}; expected [vocab, text_hidden]"
                 )));
             }
+            let text_embed_dim = text_shape[1];
             if !matches!(text_embedding_tensor.dtype(), Dtype::F32 | Dtype::BF16) {
                 return Err(Error::InvalidInput(format!(
                     "talker.model.text_embedding.weight has dtype {:?}, expected F32 or BF16",
@@ -267,25 +287,31 @@ impl CustomVoiceTextPrep {
             let codec_embedding_tensor = tensors.tensor("talker.model.codec_embedding.weight")
                 .map_err(|err| Error::InvalidInput(format!("failed to load talker.model.codec_embedding.weight: {err}")))?;
             let codec_shape = codec_embedding_tensor.shape();
-            if codec_shape.len() != 2 || codec_shape[1] != HIDDEN {
+            if codec_shape.len() != 2 || codec_shape[1] != config.talker.hidden {
                 return Err(Error::InvalidInput(format!(
-                    "talker.model.codec_embedding.weight shape {codec_shape:?}; expected [vocab, {HIDDEN}]"
+                    "talker.model.codec_embedding.weight shape {codec_shape:?}; expected [vocab, {}]",
+                    config.talker.hidden
                 )));
             }
+            let hidden = codec_shape[1];
 
             let (fc1_weight, fc1_bias, fc1_in, fc1_out) = load_linear(tensors, "talker.text_projection.linear_fc1")?;
             let (fc2_weight, fc2_bias, fc2_in, fc2_out) = load_linear(tensors, "talker.text_projection.linear_fc2")?;
-            if fc1_in != TEXT_EMBED_DIM || fc1_out != TEXT_PROJ_INTERMEDIATE || fc2_in != TEXT_PROJ_INTERMEDIATE || fc2_out != HIDDEN {
+            if fc1_in != text_embed_dim || fc1_out != fc2_in || fc2_out != hidden {
                 return Err(Error::InvalidInput(format!(
                     "invalid text projection shapes: fc1=[{fc1_out},{fc1_in}], fc2=[{fc2_out},{fc2_in}]"
                 )));
             }
 
             Ok(Self {
+                config,
                 tokenizer,
                 text_embedding_dtype: text_embedding_tensor.dtype(),
                 text_embedding_data: text_embedding_tensor.data().to_vec(),
                 text_vocab: text_shape[0],
+                text_embed_dim,
+                hidden,
+                text_proj_intermediate: fc1_out,
                 fc1_weight,
                 fc1_bias,
                 fc2_weight,
@@ -319,13 +345,13 @@ impl CustomVoiceTextPrep {
         let content_ids = input_ids[3..input_ids.len() - 5].to_vec();
         let prefill = self.build_custom_voice_prefill(&content_ids, speaker, language)?;
         let mut trailing = content_ids.get(1..).unwrap_or_default().to_vec();
-        trailing.push(TTS_EOS);
+        trailing.push(self.config.tokens.tts_eos as u32);
         let trailing_text = self.projected_text_embeddings(&trailing)?;
-        let tts_pad_embed = self.projected_text_embeddings(&[TTS_PAD])?;
+        let tts_pad_embed = self.projected_text_embeddings(&[self.config.tokens.tts_pad as u32])?;
         Ok(CustomVoiceInputs {
             input_ids,
             content_ids,
-            prefill_steps: prefill.len() / HIDDEN,
+            prefill_steps: prefill.len() / self.hidden,
             prefill,
             trailing_steps: trailing.len(),
             trailing_text,
@@ -339,38 +365,55 @@ impl CustomVoiceTextPrep {
         speaker: Speaker,
         language: Language,
     ) -> Result<Vec<f32>> {
-        let role_prefix = self.projected_text_embeddings(&[IM_START, ASSISTANT, NEWLINE])?;
-        let codec = self.codec_embeddings(&[
-            CODEC_THINK,
-            CODEC_THINK_BOS,
-            language.token_id(),
-            CODEC_THINK_EOS,
-            speaker.token_id(),
-            CODEC_PAD,
-            CODEC_BOS,
+        let language_id = self.token_id(
+            "language",
+            language.config_key(),
+            &self.config.tokens.language_ids,
+        )?;
+        let speaker_id = self.token_id(
+            "speaker",
+            speaker.config_key(),
+            &self.config.tokens.speaker_ids,
+        )?;
+        let role_prefix = self.projected_text_embeddings(&[
+            self.config.tokens.im_start as u32,
+            self.config.tokens.assistant as u32,
+            NEWLINE,
         ])?;
+        let codec = self.codec_embeddings(&[
+            self.config.tokens.codec_think as u32,
+            self.config.tokens.codec_think_bos as u32,
+            language_id as u32,
+            self.config.tokens.codec_think_eos as u32,
+            speaker_id as u32,
+            self.config.tokens.codec_pad as u32,
+            self.config.tokens.codec_bos as u32,
+        ])?;
+        let tts_pad = self.config.tokens.tts_pad as u32;
+        let tts_bos = self.config.tokens.tts_bos as u32;
         let tts = self
-            .projected_text_embeddings(&[TTS_PAD, TTS_PAD, TTS_PAD, TTS_PAD, TTS_PAD, TTS_BOS])?;
+            .projected_text_embeddings(&[tts_pad, tts_pad, tts_pad, tts_pad, tts_pad, tts_bos])?;
 
-        let mut hidden = Vec::with_capacity((9 + usize::from(!text_tokens.is_empty())) * HIDDEN);
+        let mut hidden =
+            Vec::with_capacity((9 + usize::from(!text_tokens.is_empty())) * self.hidden);
         hidden.extend(role_prefix);
         for idx in 0..6 {
             hidden.extend(add_rows(
-                &tts[idx * HIDDEN..(idx + 1) * HIDDEN],
-                &codec[idx * HIDDEN..(idx + 1) * HIDDEN],
+                &tts[idx * self.hidden..(idx + 1) * self.hidden],
+                &codec[idx * self.hidden..(idx + 1) * self.hidden],
             ));
         }
         if let Some(&first_text) = text_tokens.first() {
             let text = self.projected_text_embeddings(&[first_text])?;
-            hidden.extend(add_rows(&text, &codec[6 * HIDDEN..7 * HIDDEN]));
+            hidden.extend(add_rows(&text, &codec[6 * self.hidden..7 * self.hidden]));
         }
         Ok(hidden)
     }
 
     fn projected_text_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let mut output = Vec::with_capacity(tokens.len() * HIDDEN);
-        let mut fc1 = vec![0.0; TEXT_PROJ_INTERMEDIATE];
-        let mut projected = vec![0.0; HIDDEN];
+        let mut output = Vec::with_capacity(tokens.len() * self.hidden);
+        let mut fc1 = vec![0.0; self.text_proj_intermediate];
+        let mut projected = vec![0.0; self.hidden];
         for &token in tokens {
             let embedding = self.text_embedding_row(token)?;
             linear(
@@ -378,8 +421,8 @@ impl CustomVoiceTextPrep {
                 &self.fc1_weight,
                 &self.fc1_bias,
                 &mut fc1,
-                TEXT_EMBED_DIM,
-                TEXT_PROJ_INTERMEDIATE,
+                self.text_embed_dim,
+                self.text_proj_intermediate,
             );
             for value in &mut fc1 {
                 *value = silu(*value);
@@ -389,8 +432,8 @@ impl CustomVoiceTextPrep {
                 &self.fc2_weight,
                 &self.fc2_bias,
                 &mut projected,
-                TEXT_PROJ_INTERMEDIATE,
-                HIDDEN,
+                self.text_proj_intermediate,
+                self.hidden,
             );
             output.extend_from_slice(&projected);
         }
@@ -398,7 +441,7 @@ impl CustomVoiceTextPrep {
     }
 
     fn codec_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let mut output = Vec::with_capacity(tokens.len() * HIDDEN);
+        let mut output = Vec::with_capacity(tokens.len() * self.hidden);
         for &token in tokens {
             let row = token as usize;
             if row >= self.codec_vocab {
@@ -407,7 +450,9 @@ impl CustomVoiceTextPrep {
                     self.codec_vocab
                 )));
             }
-            output.extend_from_slice(&self.codec_embedding[row * HIDDEN..(row + 1) * HIDDEN]);
+            output.extend_from_slice(
+                &self.codec_embedding[row * self.hidden..(row + 1) * self.hidden],
+            );
         }
         Ok(output)
     }
@@ -420,8 +465,8 @@ impl CustomVoiceTextPrep {
                 self.text_vocab
             )));
         }
-        let offset = row * TEXT_EMBED_DIM;
-        Ok((0..TEXT_EMBED_DIM)
+        let offset = row * self.text_embed_dim;
+        Ok((0..self.text_embed_dim)
             .map(|idx| {
                 read_value(
                     self.text_embedding_dtype,
@@ -430,6 +475,18 @@ impl CustomVoiceTextPrep {
                 )
             })
             .collect())
+    }
+
+    fn token_id(
+        &self,
+        kind: &str,
+        key: &str,
+        tokens: &std::collections::HashMap<String, usize>,
+    ) -> Result<usize> {
+        tokens
+            .get(key)
+            .copied()
+            .ok_or_else(|| Error::InvalidInput(format!("missing {kind} token id for {key}")))
     }
 }
 

@@ -3,6 +3,7 @@ pub mod buffer;
 pub mod code_predictor;
 pub mod codec;
 pub mod codec_hip;
+pub mod config;
 pub mod decode;
 pub mod error;
 pub mod ffi;

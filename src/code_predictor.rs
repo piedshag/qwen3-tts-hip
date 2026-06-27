@@ -5,6 +5,7 @@ use safetensors::tensor::TensorView;
 
 use crate::blas::RocblasHandle;
 use crate::buffer::DeviceBuffer;
+use crate::config::Qwen3TtsConfig;
 use crate::decode::DecodeStepStack;
 use crate::error::{Error, Result};
 use crate::kernel::{HipFunction, HipModule};
@@ -16,6 +17,7 @@ const CODE_PREDICTOR_PREFIX: &str = "talker.code_predictor";
 
 #[derive(Clone, Debug)]
 pub struct CodePredictorConfig {
+    pub talker_hidden: usize,
     pub layer_count: usize,
     pub num_code_groups: usize,
     pub vocab_size: usize,
@@ -26,6 +28,7 @@ pub struct CodePredictorConfig {
 impl Default for CodePredictorConfig {
     fn default() -> Self {
         Self {
+            talker_hidden: 1024,
             layer_count: 5,
             num_code_groups: 16,
             vocab_size: 2048,
@@ -44,14 +47,19 @@ pub struct CodePrediction {
 pub struct HipCodePredictor {
     config: CodePredictorConfig,
     hidden: usize,
+    talker_hidden: usize,
     stack: DecodeStepStack,
     blas: RocblasHandle,
     kernels: CodePredictorKernels,
+    projection_weight: Option<DeviceBuffer<f32>>,
+    projection_bias: Option<DeviceBuffer<f32>>,
     norm_gamma: DeviceBuffer<f32>,
     lm_heads: Vec<DeviceBuffer<f32>>,
     codec_embeddings: Vec<DeviceBuffer<f32>>,
     prefill_hidden: DeviceBuffer<f32>,
     step_hidden: DeviceBuffer<f32>,
+    projected_prefix: DeviceBuffer<f32>,
+    projected_embedding: DeviceBuffer<f32>,
     normed: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     token: DeviceBuffer<i32>,
@@ -69,12 +77,25 @@ struct CodePredictorKernels {
     embedding_lookup: HipFunction,
     store_token: HipFunction,
     residual_add: HipFunction,
+    bias_add: HipFunction,
     _elementwise_module: HipModule,
 }
 
 impl HipCodePredictor {
     pub fn load(runtime: &HipRuntime, model_dir: &Path) -> Result<Self> {
-        Self::load_with_config(runtime, model_dir, CodePredictorConfig::default())
+        let config = Qwen3TtsConfig::load(model_dir)?;
+        Self::load_with_config(
+            runtime,
+            model_dir,
+            CodePredictorConfig {
+                talker_hidden: config.talker.hidden,
+                layer_count: config.code_predictor.layers,
+                num_code_groups: config.code_predictor.num_code_groups,
+                vocab_size: config.code_predictor.vocab,
+                epsilon: config.code_predictor.rms_eps,
+                theta: config.code_predictor.rope_theta,
+            },
+        )
     }
 
     pub fn load_with_config(
@@ -89,6 +110,7 @@ impl HipCodePredictor {
         }
         let num_acoustic = config.num_code_groups - 1;
         let vocab_size = config.vocab_size;
+        let talker_hidden = config.talker_hidden;
         let stack = DecodeStepStack::load_with_prefix(
             runtime,
             model_dir,
@@ -99,6 +121,11 @@ impl HipCodePredictor {
             config.theta,
         )?;
         let hidden = stack.dims().hidden;
+        if hidden == 0 || config.talker_hidden == 0 {
+            return Err(Error::InvalidInput(
+                "CodePredictor hidden sizes must be non-zero".to_string(),
+            ));
+        }
         let archive = TensorArchive::open(&model_dir.join("model.safetensors"))?;
         let norm_gamma =
             archive.vector_f32(&format!("{CODE_PREDICTOR_PREFIX}.model.norm.weight"))?;
@@ -108,6 +135,33 @@ impl HipCodePredictor {
                 norm_gamma.len()
             )));
         }
+
+        let (projection_weight, projection_bias) = if config.talker_hidden != hidden {
+            let (weight, in_dim, out_dim) = archive.linear_weight_transposed_f32(&format!(
+                "{CODE_PREDICTOR_PREFIX}.small_to_mtp_projection.weight"
+            ))?;
+            if in_dim != config.talker_hidden || out_dim != hidden {
+                return Err(Error::InvalidInput(format!(
+                    "small_to_mtp_projection.weight shape out={out_dim}, in={in_dim}; expected out={hidden}, in={}",
+                    config.talker_hidden
+                )));
+            }
+            let bias = archive.vector_f32(&format!(
+                "{CODE_PREDICTOR_PREFIX}.small_to_mtp_projection.bias"
+            ))?;
+            if bias.len() != hidden {
+                return Err(Error::InvalidInput(format!(
+                    "small_to_mtp_projection.bias len {} does not match hidden {hidden}",
+                    bias.len()
+                )));
+            }
+            (
+                Some(runtime.buffer_from_slice(&weight)?),
+                Some(runtime.buffer_from_slice(&bias)?),
+            )
+        } else {
+            (None, None)
+        };
 
         let mut lm_heads = Vec::with_capacity(num_acoustic);
         let mut codec_embeddings = Vec::with_capacity(num_acoustic);
@@ -128,7 +182,7 @@ impl HipCodePredictor {
                     "{CODE_PREDICTOR_PREFIX}.model.codec_embedding.{group}.weight"
                 ))?,
                 vocab_size,
-                hidden,
+                talker_hidden,
                 group,
             )?;
             codec_embeddings.push(runtime.buffer_from_slice(&embedding)?);
@@ -137,25 +191,34 @@ impl HipCodePredictor {
         Ok(Self {
             config,
             hidden,
+            talker_hidden,
             stack,
             blas: runtime.create_blas_handle()?,
             kernels: CodePredictorKernels::compile(runtime)?,
+            projection_weight,
+            projection_bias,
             norm_gamma: runtime.buffer_from_slice(&norm_gamma)?,
             lm_heads,
             codec_embeddings,
             prefill_hidden: runtime.empty_buffer::<f32>(hidden)?,
             step_hidden: runtime.empty_buffer::<f32>(hidden)?,
+            projected_prefix: runtime.empty_buffer::<f32>(2 * hidden)?,
+            projected_embedding: runtime.empty_buffer::<f32>(hidden)?,
             normed: runtime.empty_buffer::<f32>(hidden)?,
             logits: runtime.empty_buffer::<f32>(vocab_size)?,
             token: runtime.empty_buffer::<i32>(1)?,
             tokens: runtime.empty_buffer::<i32>(num_acoustic)?,
-            current_embedding: runtime.empty_buffer::<f32>(hidden)?,
-            embedding_sum: runtime.empty_buffer::<f32>(hidden)?,
+            current_embedding: runtime.empty_buffer::<f32>(talker_hidden)?,
+            embedding_sum: runtime.empty_buffer::<f32>(talker_hidden)?,
         })
     }
 
     pub fn hidden(&self) -> usize {
         self.hidden
+    }
+
+    pub fn talker_hidden(&self) -> usize {
+        self.talker_hidden
     }
 
     pub fn num_acoustic_groups(&self) -> usize {
@@ -167,10 +230,10 @@ impl HipCodePredictor {
         talker_hidden: &[f32],
         semantic_embed: &[f32],
     ) -> Result<CodePrediction> {
-        if talker_hidden.len() != self.hidden || semantic_embed.len() != self.hidden {
+        if talker_hidden.len() != self.talker_hidden || semantic_embed.len() != self.talker_hidden {
             return Err(Error::InvalidInput(format!(
                 "CodePredictor inputs must have length {}, got talker_hidden={}, semantic_embed={}",
-                self.hidden,
+                self.talker_hidden,
                 talker_hidden.len(),
                 semantic_embed.len()
             )));
@@ -195,10 +258,10 @@ impl HipCodePredictor {
         prefix: &DeviceBuffer<f32>,
         embedding_sum: &DeviceBuffer<f32>,
     ) -> Result<Vec<i32>> {
-        if embedding_sum.len() != self.hidden {
+        if embedding_sum.len() != self.talker_hidden {
             return Err(Error::InvalidInput(format!(
                 "embedding_sum output length must be {}, got {}",
-                self.hidden,
+                self.talker_hidden,
                 embedding_sum.len()
             )));
         }
@@ -208,15 +271,16 @@ impl HipCodePredictor {
     }
 
     fn generate_inner(&self, prefix: &DeviceBuffer<f32>) -> Result<()> {
-        if prefix.len() != 2 * self.hidden {
+        if prefix.len() != 2 * self.talker_hidden {
             return Err(Error::InvalidInput(format!(
                 "CodePredictor prefix length must be {}, got {}",
-                2 * self.hidden,
+                2 * self.talker_hidden,
                 prefix.len()
             )));
         }
         let num_acoustic = self.num_acoustic_groups();
-        self.stack.prefill(prefix, 2)?;
+        let stack_prefix = self.project_to_stack(prefix, &self.projected_prefix, 2)?;
+        self.stack.prefill(stack_prefix, 2)?;
         self.stack.copy_prefill_step_to(&self.prefill_hidden, 1)?;
         self.logits_for_hidden(&self.prefill_hidden, 0)?;
         launch_argmax(
@@ -231,14 +295,16 @@ impl HipCodePredictor {
             &self.codec_embeddings[0],
             &self.token,
             &self.current_embedding,
-            self.hidden,
+            self.talker_hidden,
         )?;
         self.embedding_sum
             .copy_from_device(&self.current_embedding)?;
 
         for group in 1..num_acoustic {
+            let stack_embedding =
+                self.project_to_stack(&self.current_embedding, &self.projected_embedding, 1)?;
             self.stack
-                .decode_step(&self.current_embedding, &self.step_hidden, group + 1)?;
+                .decode_step(stack_embedding, &self.step_hidden, group + 1)?;
             self.logits_for_hidden(&self.step_hidden, group)?;
             launch_argmax(
                 &self.kernels.argmax,
@@ -252,17 +318,45 @@ impl HipCodePredictor {
                 &self.codec_embeddings[group],
                 &self.token,
                 &self.current_embedding,
-                self.hidden,
+                self.talker_hidden,
             )?;
             launch_residual_add(
                 &self.kernels.residual_add,
                 self.embedding_sum.as_ptr(),
                 self.current_embedding.as_ptr(),
                 self.embedding_sum.as_mut_ptr(),
-                self.hidden,
+                self.talker_hidden,
             )?;
         }
         Ok(())
+    }
+
+    fn project_to_stack<'a>(
+        &'a self,
+        input: &'a DeviceBuffer<f32>,
+        output: &'a DeviceBuffer<f32>,
+        rows: usize,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        if self.talker_hidden == self.hidden {
+            return Ok(input);
+        }
+        let weight = self.projection_weight.as_ref().ok_or_else(|| {
+            Error::InvalidInput("missing CodePredictor projection weight".to_string())
+        })?;
+        let bias = self.projection_bias.as_ref().ok_or_else(|| {
+            Error::InvalidInput("missing CodePredictor projection bias".to_string())
+        })?;
+        self.blas
+            .sgemm_row_major(input, weight, output, rows, self.hidden, self.talker_hidden)?;
+        launch_bias_add(
+            &self.kernels.bias_add,
+            output,
+            bias,
+            output,
+            rows,
+            self.hidden,
+        )?;
+        Ok(output)
     }
 
     fn logits_for_hidden(&self, hidden: &DeviceBuffer<f32>, group: usize) -> Result<()> {
@@ -307,6 +401,7 @@ impl CodePredictorKernels {
             embedding_lookup: embedding_module.function("embedding_lookup_f32")?,
             store_token: embedding_module.function("store_token_i32")?,
             residual_add: elementwise_module.function("residual_add_f32")?,
+            bias_add: elementwise_module.function("bias_add_f32")?,
             _rms_module: rms_module,
             _argmax_module: argmax_module,
             _embedding_module: embedding_module,
@@ -333,6 +428,32 @@ fn embedding_table_f32(
         tensor.data(),
         vocab_size * hidden,
     )
+}
+
+fn launch_bias_add(
+    function: &HipFunction,
+    input: &DeviceBuffer<f32>,
+    bias: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    rows: usize,
+    cols: usize,
+) -> Result<()> {
+    let total = rows * cols;
+    let mut input_ptr = input.as_ptr();
+    let mut bias_ptr = bias.as_ptr();
+    let mut output_ptr = output.as_mut_ptr();
+    let mut rows_i32 = rows as i32;
+    let mut cols_i32 = cols as i32;
+    let mut params = [
+        &mut input_ptr as *mut *const c_void as *mut c_void,
+        &mut bias_ptr as *mut *const c_void as *mut c_void,
+        &mut output_ptr as *mut *mut c_void as *mut c_void,
+        &mut rows_i32 as *mut i32 as *mut c_void,
+        &mut cols_i32 as *mut i32 as *mut c_void,
+    ];
+    let block = 256u32;
+    let grid = (total as u32).div_ceil(block);
+    function.launch((grid, 1, 1), (block, 1, 1), 0, &mut params)
 }
 
 fn launch_rmsnorm(
