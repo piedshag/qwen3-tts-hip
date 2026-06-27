@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_hip_runtime::codec::{decode_codes_to_waveform, write_wav};
-use qwen3_hip_runtime::{Error, Result};
+use qwen3_hip_runtime::codec::write_wav;
+use qwen3_hip_runtime::codec_hip::HipCodecInitial;
+use qwen3_hip_runtime::{Error, HipRuntime, Result};
 
 const CODE_GROUPS: usize = 16;
 
@@ -25,7 +26,9 @@ fn main() -> Result<()> {
     let wav_gain = parse_f32_arg(args.next(), "wav_gain")?.unwrap_or(1.0);
 
     let codes = read_codes(&codes_path)?;
-    let waveform = decode_codes_to_waveform(&model_dir, &codes)?;
+    let runtime = HipRuntime::new(0)?;
+    let decoder = HipCodecInitial::load(&runtime, &model_dir)?;
+    let waveform = decode_waveform(&runtime, &decoder, &codes)?;
     if let Some(reference) = reference_waveform.as_deref() {
         compare_waveform(&waveform, reference)?;
     }
@@ -34,7 +37,7 @@ fn main() -> Result<()> {
     }
     println!(
         "HIP codec decode OK: frames={}, samples={}, reference={:?}, output_wav={:?}",
-        codes.len(),
+        codes.len() / CODE_GROUPS,
         waveform.len(),
         reference_waveform,
         output_wav
@@ -42,7 +45,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn read_codes(path: &Path) -> Result<Vec<Vec<u32>>> {
+fn read_codes(path: &Path) -> Result<Vec<i32>> {
     let npy = read_npy_f32(path).map_err(|err| Error::InvalidInput(err.to_string()))?;
     if npy.shape.len() != 2 || npy.shape[1] != CODE_GROUPS {
         return Err(Error::InvalidInput(format!(
@@ -52,14 +55,30 @@ fn read_codes(path: &Path) -> Result<Vec<Vec<u32>>> {
     }
     Ok(npy
         .data
-        .chunks_exact(CODE_GROUPS)
-        .map(|frame| {
-            frame
-                .iter()
-                .map(|value| value.round().max(0.0) as u32)
-                .collect()
-        })
+        .iter()
+        .map(|value| value.round().max(0.0) as i32)
         .collect())
+}
+
+fn decode_waveform(
+    runtime: &HipRuntime,
+    decoder: &HipCodecInitial,
+    codes: &[i32],
+) -> Result<Vec<f32>> {
+    if codes.len() % CODE_GROUPS != 0 {
+        return Err(Error::InvalidInput(format!(
+            "code length {} is not divisible by {CODE_GROUPS}",
+            codes.len()
+        )));
+    }
+    let frames = codes.len() / CODE_GROUPS;
+    let initial = decoder.run(runtime, codes, frames)?;
+    let pre_transformer =
+        decoder.run_pre_transformer(runtime, &initial.pre_conv, initial.frames)?;
+    let upsample = decoder.run_upsample_stages(runtime, &pre_transformer, initial.frames)?;
+    let output = decoder.run_decoder_stages(runtime, &upsample.upsample_1_1, upsample.frames_1)?;
+    runtime.synchronize()?;
+    output.waveform.copy_to_host()
 }
 
 fn compare_waveform(actual: &[f32], path: &Path) -> Result<()> {

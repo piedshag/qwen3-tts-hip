@@ -5,7 +5,6 @@ edition = "2024"
 license = "MIT"
 
 [dependencies]
-burn = { version = "0.21.0", default-features = false, features = ["std", "flex"] }
 hound = "3.5.1"
 libloading = "0.8.9"
 safetensors = "0.6.2"
