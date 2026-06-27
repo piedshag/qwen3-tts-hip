@@ -1,20 +1,71 @@
-pub mod blas;
-pub mod buffer;
-pub mod code_predictor;
-pub mod codec;
-pub mod codec_hip;
-pub mod config;
-pub mod decode;
+pub mod audio;
 pub mod error;
-pub mod ffi;
-pub mod graph;
-pub mod kernel;
-pub mod kernels;
-pub mod runtime;
-pub mod stack;
-pub mod talker;
-pub mod text;
-pub mod weights;
+pub mod gpu;
+pub mod model;
+
+pub mod blas {
+    pub use crate::gpu::blas::*;
+}
+
+pub mod buffer {
+    pub use crate::gpu::buffer::*;
+}
+
+pub mod code_predictor {
+    pub use crate::model::code_predictor::*;
+}
+
+pub mod codec {
+    pub use crate::audio::codec::*;
+}
+
+pub mod codec_hip {
+    pub use crate::audio::codec_hip::*;
+}
+
+pub mod config {
+    pub use crate::model::config::*;
+}
+
+pub mod decode {
+    pub use crate::model::decode::*;
+}
+
+pub(crate) mod ffi {
+    pub(crate) use crate::gpu::ffi::*;
+}
+
+pub mod graph {
+    pub use crate::gpu::graph::*;
+}
+
+pub mod kernel {
+    pub use crate::gpu::kernel::*;
+}
+
+pub mod kernels {
+    pub use crate::gpu::kernels::*;
+}
+
+pub mod runtime {
+    pub use crate::gpu::runtime::*;
+}
+
+pub mod stack {
+    pub use crate::model::stack::*;
+}
+
+pub mod talker {
+    pub use crate::model::talker::*;
+}
+
+pub mod text {
+    pub use crate::model::text::*;
+}
+
+pub mod weights {
+    pub use crate::model::weights::*;
+}
 
 pub use blas::RocblasHandle;
 pub use buffer::DeviceBuffer;
