@@ -1,0 +1,5 @@
+/target/
+**/*.wav
+*.profraw
+*.profdata
+.DS_Store
