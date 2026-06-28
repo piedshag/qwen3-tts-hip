@@ -640,6 +640,55 @@ extern "C" __global__ void codec_causal_conv1d_dilated_f32(
     output[out_c * frames + t] = sum;
 }
 
+extern "C" __global__ void codec_causal_conv1d_dilated_tiled_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int frames,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int dilation,
+    int causal_padding
+) {
+    const int oc_tile = 16;
+    const int red_lanes = 16;
+    int lane_oc = threadIdx.x;
+    int lane_red = threadIdx.y;
+    int t = blockIdx.x;
+    int out_c = blockIdx.y * oc_tile + lane_oc;
+    extern __shared__ float scratch[];
+    int scratch_idx = lane_red * oc_tile + lane_oc;
+
+    float sum = 0.0f;
+    if (out_c < out_channels && t < frames) {
+        int reductions = in_channels * kernel_size;
+        for (int red = lane_red; red < reductions; red += red_lanes) {
+            int k = red % kernel_size;
+            int in_c = red / kernel_size;
+            int source_t = t + k * dilation - causal_padding;
+            if (source_t >= 0 && source_t < frames) {
+                float value = input[in_c * frames + source_t];
+                float w = weight[(out_c * in_channels + in_c) * kernel_size + k];
+                sum += value * w;
+            }
+        }
+    }
+    scratch[scratch_idx] = sum;
+    __syncthreads();
+
+    for (int stride = red_lanes / 2; stride > 0; stride >>= 1) {
+        if (lane_red < stride) {
+            scratch[scratch_idx] += scratch[(lane_red + stride) * oc_tile + lane_oc];
+        }
+        __syncthreads();
+    }
+    if (lane_red == 0 && out_c < out_channels && t < frames) {
+        output[out_c * frames + t] = scratch[lane_oc] + bias[out_c];
+    }
+}
+
 extern "C" __global__ void codec_transconv1d_channels_f32(
     const float* input,
     const float* weight,
@@ -674,6 +723,97 @@ extern "C" __global__ void codec_transconv1d_channels_f32(
         }
     }
     output[out_c * out_frames + out_t] = sum;
+}
+
+extern "C" __global__ void codec_transconv1d_channels_tiled_f32(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int in_frames,
+    int out_frames,
+    int in_channels,
+    int out_channels,
+    int kernel_size,
+    int stride
+) {
+    const int oc_tile = 16;
+    const int red_lanes = 16;
+    int lane_oc = threadIdx.x;
+    int lane_red = threadIdx.y;
+    int out_t = blockIdx.x;
+    int out_c = blockIdx.y * oc_tile + lane_oc;
+    extern __shared__ float scratch[];
+    int scratch_idx = lane_red * oc_tile + lane_oc;
+
+    float sum = 0.0f;
+    if (out_c < out_channels && out_t < out_frames) {
+        for (int k = 0; k < kernel_size; k++) {
+            int rem = out_t - k;
+            if (rem >= 0 && rem % stride == 0) {
+                int in_t = rem / stride;
+                if (in_t >= 0 && in_t < in_frames) {
+                    for (int in_c = lane_red; in_c < in_channels; in_c += red_lanes) {
+                        float value = input[in_c * in_frames + in_t];
+                        float w = weight[(in_c * out_channels + out_c) * kernel_size + k];
+                        sum += value * w;
+                    }
+                }
+            }
+        }
+    }
+    scratch[scratch_idx] = sum;
+    __syncthreads();
+
+    for (int step = red_lanes / 2; step > 0; step >>= 1) {
+        if (lane_red < step) {
+            scratch[scratch_idx] += scratch[(lane_red + step) * oc_tile + lane_oc];
+        }
+        __syncthreads();
+    }
+    if (lane_red == 0 && out_c < out_channels && out_t < out_frames) {
+        output[out_c * out_frames + out_t] = scratch[lane_oc] + bias[out_c];
+    }
+}
+
+extern "C" __global__ void codec_transconv_prepare_tc_f32(
+    const float* input,
+    float* current_tc,
+    float* previous_tc,
+    int frames,
+    int channels,
+    int total
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int channel = idx % channels;
+    int frame = idx / channels;
+    current_tc[idx] = input[channel * frames + frame];
+    previous_tc[idx] = frame > 0 ? input[channel * frames + frame - 1] : 0.0f;
+}
+
+extern "C" __global__ void codec_transconv_scatter_sum_f32(
+    const float* current,
+    const float* previous,
+    const float* bias,
+    float* output,
+    int frames,
+    int out_channels,
+    int out_frames,
+    int stride,
+    int phase,
+    int total
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int out_c = idx % out_channels;
+    int frame = idx / out_channels;
+    int out_t = frame * stride + phase;
+    output[out_c * out_frames + out_t] = current[idx] + previous[idx] + bias[out_c];
 }
 
 extern "C" __global__ void codec_clamp_f32(

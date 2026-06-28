@@ -44,6 +44,10 @@ pub mod kernel {
     pub use crate::gpu::kernel::*;
 }
 
+pub mod profile {
+    pub use crate::gpu::profile::*;
+}
+
 pub mod kernels {
     pub use crate::gpu::kernels::*;
 }

@@ -11,6 +11,7 @@ use crate::kernels::{
     ATTENTION_F32_SOURCE, CODEC_INITIAL_F32_SOURCE, ELEMENTWISE_F32_SOURCE, LAYOUT_F32_SOURCE,
     RMSNORM_F32_SOURCE, ROPE_BHSD_F32_SOURCE, SOFTMAX_F32_SOURCE,
 };
+use crate::profile;
 use crate::runtime::HipRuntime;
 use crate::weights::{TensorArchive, tensor_to_f32};
 
@@ -86,7 +87,11 @@ struct CodecInitialKernels {
     convnext_residual: HipFunction,
     snake_beta: HipFunction,
     causal_conv1d_dilated: HipFunction,
+    causal_conv1d_dilated_tiled: HipFunction,
     transconv1d_channels: HipFunction,
+    transconv1d_channels_tiled: HipFunction,
+    transconv_prepare_tc: HipFunction,
+    transconv_scatter_sum: HipFunction,
     clamp: HipFunction,
     rmsnorm: HipFunction,
     rope: HipFunction,
@@ -153,6 +158,8 @@ struct DecoderBlockWeights {
     snake: SnakeWeights,
     trans_weight: DeviceBuffer<f32>,
     trans_bias: DeviceBuffer<f32>,
+    trans_weight_current: Vec<DeviceBuffer<f32>>,
+    trans_weight_previous: Vec<DeviceBuffer<f32>>,
     in_channels: usize,
     out_channels: usize,
     kernel_size: usize,
@@ -324,6 +331,7 @@ impl HipCodecInitial {
         codes: &[i32],
         frames: usize,
     ) -> Result<HipCodecInitialOutput> {
+        let _range = profile::range("codec.initial");
         if frames == 0 || codes.len() != frames * CODE_GROUPS {
             return Err(Error::InvalidInput(format!(
                 "codes length {} does not match frames*groups {}",
@@ -365,6 +373,7 @@ impl HipCodecInitial {
         pre_conv: &DeviceBuffer<f32>,
         frames: usize,
     ) -> Result<DeviceBuffer<f32>> {
+        let _range = profile::range("codec.pre_transformer");
         if pre_conv.len() != PRE_CONV_OUT * frames {
             return Err(Error::InvalidInput(format!(
                 "pre_conv length {} does not match {}",
@@ -423,6 +432,7 @@ impl HipCodecInitial {
 
         let mut current_a = true;
         for layer in &self.layers {
+            let _range = profile::range("codec.pre_transformer.layer");
             let (input, output) = if current_a {
                 (&hidden_a, &hidden_b)
             } else {
@@ -639,6 +649,7 @@ impl HipCodecInitial {
         input: &DeviceBuffer<f32>,
         frames: usize,
     ) -> Result<HipCodecUpsampleOutputs> {
+        let _range = profile::range("codec.upsample");
         if self.upsample_stages.len() != 2 {
             return Err(Error::InvalidInput(
                 "expected 2 upsample stages".to_string(),
@@ -687,6 +698,7 @@ impl HipCodecInitial {
         trans_output: &DeviceBuffer<f32>,
         block_output: &DeviceBuffer<f32>,
     ) -> Result<()> {
+        let _range = profile::range("codec.upsample.stage");
         let out_frames = in_frames * UPSAMPLE_RATIO;
         launch_transconv1d(
             &self.kernels.transconv1d,
@@ -783,6 +795,7 @@ impl HipCodecInitial {
         input: &DeviceBuffer<f32>,
         frames: usize,
     ) -> Result<HipCodecDecoderOutputs> {
+        let _range = profile::range("codec.decoder");
         let decoder_0 = runtime.empty_buffer::<f32>(DECODER_INIT_CHANNELS * frames)?;
         self.run_causal_conv(input, &self.decoder_init, &decoder_0, frames)?;
 
@@ -876,6 +889,7 @@ impl HipCodecInitial {
         block: &DecoderBlockWeights,
         output: &DeviceBuffer<f32>,
     ) -> Result<()> {
+        let _range = profile::range("codec.decoder.block");
         let snake = runtime.empty_buffer::<f32>(block.in_channels * in_frames)?;
         launch_snake(
             &self.kernels.snake_beta,
@@ -886,24 +900,99 @@ impl HipCodecInitial {
         )?;
         let out_frames = in_frames * block.stride;
         let trans = runtime.empty_buffer::<f32>(block.out_channels * out_frames)?;
-        launch_transconv1d_channels(
-            &self.kernels.transconv1d_channels,
-            &snake,
-            &block.trans_weight,
-            &block.trans_bias,
-            &trans,
-            in_frames,
-            out_frames,
-            block.in_channels,
-            block.out_channels,
-            block.kernel_size,
-            block.stride,
-        )?;
+        if use_gemm_transconv() {
+            let _range = profile::range("codec.decoder.transconv_gemm");
+            self.run_decoder_transconv_gemm(runtime, &snake, in_frames, block, &trans)?;
+        } else if use_tiled_codec_kernels() {
+            let _range = profile::range("codec.decoder.transconv");
+            launch_transconv1d_channels_tiled(
+                &self.kernels.transconv1d_channels_tiled,
+                &snake,
+                &block.trans_weight,
+                &block.trans_bias,
+                &trans,
+                in_frames,
+                out_frames,
+                block.in_channels,
+                block.out_channels,
+                block.kernel_size,
+                block.stride,
+            )?;
+        } else {
+            let _range = profile::range("codec.decoder.transconv");
+            launch_transconv1d_channels(
+                &self.kernels.transconv1d_channels,
+                &snake,
+                &block.trans_weight,
+                &block.trans_bias,
+                &trans,
+                in_frames,
+                out_frames,
+                block.in_channels,
+                block.out_channels,
+                block.kernel_size,
+                block.stride,
+            )?;
+        }
         let res1 = runtime.empty_buffer::<f32>(block.out_channels * out_frames)?;
         self.run_residual_unit(runtime, &trans, out_frames, &block.res1, &res1)?;
         let res2 = runtime.empty_buffer::<f32>(block.out_channels * out_frames)?;
         self.run_residual_unit(runtime, &res1, out_frames, &block.res2, &res2)?;
         self.run_residual_unit(runtime, &res2, out_frames, &block.res3, output)
+    }
+
+    fn run_decoder_transconv_gemm(
+        &self,
+        runtime: &HipRuntime,
+        input: &DeviceBuffer<f32>,
+        in_frames: usize,
+        block: &DecoderBlockWeights,
+        output: &DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let out_frames = in_frames * block.stride;
+        let input_current = runtime.empty_buffer::<f32>(in_frames * block.in_channels)?;
+        let input_previous = runtime.empty_buffer::<f32>(in_frames * block.in_channels)?;
+        let phase_current = runtime.empty_buffer::<f32>(in_frames * block.out_channels)?;
+        let phase_previous = runtime.empty_buffer::<f32>(in_frames * block.out_channels)?;
+        launch_transconv_prepare_tc(
+            &self.kernels.transconv_prepare_tc,
+            input,
+            &input_current,
+            &input_previous,
+            in_frames,
+            block.in_channels,
+        )?;
+        for phase in 0..block.stride {
+            self.blas.sgemm_row_major(
+                &input_current,
+                &block.trans_weight_current[phase],
+                &phase_current,
+                in_frames,
+                block.out_channels,
+                block.in_channels,
+            )?;
+            self.blas.sgemm_row_major(
+                &input_previous,
+                &block.trans_weight_previous[phase],
+                &phase_previous,
+                in_frames,
+                block.out_channels,
+                block.in_channels,
+            )?;
+            launch_transconv_scatter_sum(
+                &self.kernels.transconv_scatter_sum,
+                &phase_current,
+                &phase_previous,
+                &block.trans_bias,
+                output,
+                in_frames,
+                block.out_channels,
+                out_frames,
+                block.stride,
+                phase,
+            )?;
+        }
+        Ok(())
     }
 
     fn run_residual_unit(
@@ -914,6 +1003,7 @@ impl HipCodecInitial {
         unit: &ResidualUnitWeights,
         output: &DeviceBuffer<f32>,
     ) -> Result<()> {
+        let _range = profile::range("codec.decoder.residual_unit");
         let act1 = runtime.empty_buffer::<f32>(unit.conv1.in_channels * frames)?;
         let conv1 = runtime.empty_buffer::<f32>(unit.conv1.out_channels * frames)?;
         let act2 = runtime.empty_buffer::<f32>(unit.conv2.in_channels * frames)?;
@@ -938,20 +1028,51 @@ impl HipCodecInitial {
         output: &DeviceBuffer<f32>,
         frames: usize,
     ) -> Result<()> {
-        launch_causal_conv1d_dilated(
-            &self.kernels.causal_conv1d_dilated,
-            input,
-            &conv.weight,
-            &conv.bias,
-            output,
-            frames,
-            conv.in_channels,
-            conv.out_channels,
-            conv.kernel_size,
-            conv.dilation,
-            conv.causal_padding,
-        )
+        let _range = profile::range("codec.decoder.causal_conv");
+        if use_tiled_codec_kernels() {
+            launch_causal_conv1d_dilated_tiled(
+                &self.kernels.causal_conv1d_dilated_tiled,
+                input,
+                &conv.weight,
+                &conv.bias,
+                output,
+                frames,
+                conv.in_channels,
+                conv.out_channels,
+                conv.kernel_size,
+                conv.dilation,
+                conv.causal_padding,
+            )
+        } else {
+            launch_causal_conv1d_dilated(
+                &self.kernels.causal_conv1d_dilated,
+                input,
+                &conv.weight,
+                &conv.bias,
+                output,
+                frames,
+                conv.in_channels,
+                conv.out_channels,
+                conv.kernel_size,
+                conv.dilation,
+                conv.causal_padding,
+            )
+        }
     }
+}
+
+fn use_tiled_codec_kernels() -> bool {
+    matches!(
+        std::env::var("QWEN3_HIP_TILED_CODEC").as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    )
+}
+
+fn use_gemm_transconv() -> bool {
+    !matches!(
+        std::env::var("QWEN3_HIP_DIRECT_TRANSCONV").as_deref(),
+        Ok("1" | "true" | "yes" | "on")
+    )
 }
 
 impl CodecInitialKernels {
@@ -979,7 +1100,12 @@ impl CodecInitialKernels {
             convnext_residual: module.function("codec_convnext_residual_f32")?,
             snake_beta: module.function("codec_snake_beta_f32")?,
             causal_conv1d_dilated: module.function("codec_causal_conv1d_dilated_f32")?,
+            causal_conv1d_dilated_tiled: module
+                .function("codec_causal_conv1d_dilated_tiled_f32")?,
             transconv1d_channels: module.function("codec_transconv1d_channels_f32")?,
+            transconv1d_channels_tiled: module.function("codec_transconv1d_channels_tiled_f32")?,
+            transconv_prepare_tc: module.function("codec_transconv_prepare_tc_f32")?,
+            transconv_scatter_sum: module.function("codec_transconv_scatter_sum_f32")?,
             clamp: module.function("codec_clamp_f32")?,
             rmsnorm: rms_module.function("rmsnorm_f32")?,
             rope: rope_module.function("rope_bhsd_f32")?,
@@ -1130,10 +1256,30 @@ fn load_decoder_block(
         &[in_channels, out_channels, kernel_size],
     )?;
     let trans_bias = vector_f32(archive, &format!("{prefix}.1.conv.bias"), out_channels)?;
+    let mut trans_weight_current = Vec::with_capacity(stride);
+    let mut trans_weight_previous = Vec::with_capacity(stride);
+    for phase in 0..stride {
+        trans_weight_current.push(runtime.buffer_from_slice(&pack_transconv_phase(
+            &trans_weight,
+            in_channels,
+            out_channels,
+            kernel_size,
+            phase,
+        )?)?);
+        trans_weight_previous.push(runtime.buffer_from_slice(&pack_transconv_phase(
+            &trans_weight,
+            in_channels,
+            out_channels,
+            kernel_size,
+            phase + stride,
+        )?)?);
+    }
     Ok(DecoderBlockWeights {
         snake: load_snake(runtime, archive, &format!("{prefix}.0"), in_channels)?,
         trans_weight: runtime.buffer_from_slice(&trans_weight)?,
         trans_bias: runtime.buffer_from_slice(&trans_bias)?,
+        trans_weight_current,
+        trans_weight_previous,
         in_channels,
         out_channels,
         kernel_size,
@@ -1142,6 +1288,27 @@ fn load_decoder_block(
         res2: load_residual_unit(runtime, archive, &format!("{prefix}.3"), out_channels, 3)?,
         res3: load_residual_unit(runtime, archive, &format!("{prefix}.4"), out_channels, 9)?,
     })
+}
+
+fn pack_transconv_phase(
+    weight: &[f32],
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    phase: usize,
+) -> Result<Vec<f32>> {
+    if phase >= kernel_size {
+        return Err(Error::InvalidInput(format!(
+            "transconv phase {phase} outside kernel size {kernel_size}"
+        )));
+    }
+    let mut packed = Vec::with_capacity(in_channels * out_channels);
+    for in_c in 0..in_channels {
+        for out_c in 0..out_channels {
+            packed.push(weight[(in_c * out_channels + out_c) * kernel_size + phase]);
+        }
+    }
+    Ok(packed)
 }
 
 fn load_residual_unit(
@@ -1754,6 +1921,44 @@ fn launch_causal_conv1d_dilated(
     kernel.launch((grid, 1, 1), (block, 1, 1), 0, &mut params)
 }
 
+fn launch_causal_conv1d_dilated_tiled(
+    kernel: &HipFunction,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    bias: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    frames: usize,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    dilation: usize,
+    causal_padding: usize,
+) -> Result<()> {
+    let mut frames_i = frames as i32;
+    let mut in_channels_i = in_channels as i32;
+    let mut out_channels_i = out_channels as i32;
+    let mut kernel_size_i = kernel_size as i32;
+    let mut dilation_i = dilation as i32;
+    let mut causal_padding_i = causal_padding as i32;
+    let mut params = [
+        &mut (input.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (weight.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (bias.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (output.as_mut_ptr()) as *mut _ as *mut c_void,
+        &mut frames_i as *mut _ as *mut c_void,
+        &mut in_channels_i as *mut _ as *mut c_void,
+        &mut out_channels_i as *mut _ as *mut c_void,
+        &mut kernel_size_i as *mut _ as *mut c_void,
+        &mut dilation_i as *mut _ as *mut c_void,
+        &mut causal_padding_i as *mut _ as *mut c_void,
+    ];
+    let oc_tile = 16u32;
+    let red_lanes = 16u32;
+    let grid = (frames as u32, (out_channels as u32).div_ceil(oc_tile), 1);
+    let shared = oc_tile * red_lanes * std::mem::size_of::<f32>() as u32;
+    kernel.launch(grid, (oc_tile, red_lanes, 1), shared, &mut params)
+}
+
 fn launch_transconv1d_channels(
     kernel: &HipFunction,
     input: &DeviceBuffer<f32>,
@@ -1785,6 +1990,109 @@ fn launch_transconv1d_channels(
         &mut out_channels_i as *mut _ as *mut c_void,
         &mut kernel_size_i as *mut _ as *mut c_void,
         &mut stride_i as *mut _ as *mut c_void,
+    ];
+    let block = 256u32;
+    let grid = (total as u32).div_ceil(block);
+    kernel.launch((grid, 1, 1), (block, 1, 1), 0, &mut params)
+}
+
+fn launch_transconv1d_channels_tiled(
+    kernel: &HipFunction,
+    input: &DeviceBuffer<f32>,
+    weight: &DeviceBuffer<f32>,
+    bias: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    in_frames: usize,
+    out_frames: usize,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    stride: usize,
+) -> Result<()> {
+    let mut in_frames_i = in_frames as i32;
+    let mut out_frames_i = out_frames as i32;
+    let mut in_channels_i = in_channels as i32;
+    let mut out_channels_i = out_channels as i32;
+    let mut kernel_size_i = kernel_size as i32;
+    let mut stride_i = stride as i32;
+    let mut params = [
+        &mut (input.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (weight.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (bias.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (output.as_mut_ptr()) as *mut _ as *mut c_void,
+        &mut in_frames_i as *mut _ as *mut c_void,
+        &mut out_frames_i as *mut _ as *mut c_void,
+        &mut in_channels_i as *mut _ as *mut c_void,
+        &mut out_channels_i as *mut _ as *mut c_void,
+        &mut kernel_size_i as *mut _ as *mut c_void,
+        &mut stride_i as *mut _ as *mut c_void,
+    ];
+    let oc_tile = 16u32;
+    let red_lanes = 16u32;
+    let grid = (
+        out_frames as u32,
+        (out_channels as u32).div_ceil(oc_tile),
+        1,
+    );
+    let shared = oc_tile * red_lanes * std::mem::size_of::<f32>() as u32;
+    kernel.launch(grid, (oc_tile, red_lanes, 1), shared, &mut params)
+}
+
+fn launch_transconv_prepare_tc(
+    kernel: &HipFunction,
+    input: &DeviceBuffer<f32>,
+    current: &DeviceBuffer<f32>,
+    previous: &DeviceBuffer<f32>,
+    frames: usize,
+    channels: usize,
+) -> Result<()> {
+    let total = frames * channels;
+    let mut frames_i = frames as i32;
+    let mut channels_i = channels as i32;
+    let mut total_i = total as i32;
+    let mut params = [
+        &mut (input.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (current.as_mut_ptr()) as *mut _ as *mut c_void,
+        &mut (previous.as_mut_ptr()) as *mut _ as *mut c_void,
+        &mut frames_i as *mut _ as *mut c_void,
+        &mut channels_i as *mut _ as *mut c_void,
+        &mut total_i as *mut _ as *mut c_void,
+    ];
+    let block = 256u32;
+    let grid = (total as u32).div_ceil(block);
+    kernel.launch((grid, 1, 1), (block, 1, 1), 0, &mut params)
+}
+
+fn launch_transconv_scatter_sum(
+    kernel: &HipFunction,
+    current: &DeviceBuffer<f32>,
+    previous: &DeviceBuffer<f32>,
+    bias: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    frames: usize,
+    out_channels: usize,
+    out_frames: usize,
+    stride: usize,
+    phase: usize,
+) -> Result<()> {
+    let total = frames * out_channels;
+    let mut frames_i = frames as i32;
+    let mut out_channels_i = out_channels as i32;
+    let mut out_frames_i = out_frames as i32;
+    let mut stride_i = stride as i32;
+    let mut phase_i = phase as i32;
+    let mut total_i = total as i32;
+    let mut params = [
+        &mut (current.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (previous.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (bias.as_ptr() as *mut c_void) as *mut _ as *mut c_void,
+        &mut (output.as_mut_ptr()) as *mut _ as *mut c_void,
+        &mut frames_i as *mut _ as *mut c_void,
+        &mut out_channels_i as *mut _ as *mut c_void,
+        &mut out_frames_i as *mut _ as *mut c_void,
+        &mut stride_i as *mut _ as *mut c_void,
+        &mut phase_i as *mut _ as *mut c_void,
+        &mut total_i as *mut _ as *mut c_void,
     ];
     let block = 256u32;
     let grid = (total as u32).div_ceil(block);

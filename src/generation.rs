@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::audio::codec_hip::HipCodecInitial;
 use crate::error::{Error, Result};
 use crate::gpu::buffer::DeviceBuffer;
+use crate::gpu::profile;
 use crate::gpu::runtime::HipRuntime;
 use crate::model::code_predictor::HipCodePredictor;
 use crate::model::config::Qwen3TtsConfig;
@@ -172,6 +173,7 @@ impl HipTtsEngine {
     }
 
     pub fn generate_codes(&self, text: &str, options: GenerateOptions) -> Result<GeneratedCodes> {
+        let _range = profile::range("engine.generate_codes");
         if options.max_frames == 0 {
             return Err(Error::InvalidInput(
                 "max_frames must be non-zero".to_string(),
@@ -184,9 +186,11 @@ impl HipTtsEngine {
         }
         options.talker_sampling().validate("talker")?;
         options.subtalker_sampling().validate("subtalker")?;
-        let inputs = self
-            .prep
-            .prepare_custom_voice(text, options.speaker, options.language)?;
+        let inputs = {
+            let _range = profile::range("engine.prepare_text");
+            self.prep
+                .prepare_custom_voice(text, options.speaker, options.language)?
+        };
         if inputs.prefill_steps + options.max_frames > self.max_cache_steps {
             return Err(Error::InvalidInput(format!(
                 "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
@@ -199,6 +203,7 @@ impl HipTtsEngine {
     }
 
     pub fn decode_codes(&self, codes: &[i32]) -> Result<Vec<f32>> {
+        let _range = profile::range("engine.decode_codes");
         if codes.len() % self.code_groups != 0 {
             return Err(Error::InvalidInput(format!(
                 "code length {} is not divisible by {}",
@@ -223,6 +228,7 @@ impl HipTtsEngine {
             upsample.frames_1,
         )?;
         self.runtime.synchronize()?;
+        let _range = profile::range("engine.decode.copy_to_host");
         output.waveform.copy_to_host()
     }
 
@@ -239,6 +245,7 @@ impl HipTtsEngine {
         inputs: &CustomVoiceInputs,
         options: &GenerateOptions,
     ) -> Result<GeneratedCodes> {
+        let _range = profile::range("engine.rollout");
         let max_frames = options.max_frames;
         let talker_sampling = options.talker_sampling();
         let subtalker_sampling = options.subtalker_sampling();
@@ -246,23 +253,29 @@ impl HipTtsEngine {
         let mut rng_state = options.seed ^ 0x9e37_79b9_7f4a_7c15;
         let hidden = self.talker.hidden_size();
         let prefill = self.runtime.buffer_from_slice(&inputs.prefill)?;
-        let trailing = self.upload_trailing(
-            &inputs.trailing_text,
-            &inputs.tts_pad_embed,
-            max_frames.saturating_sub(1),
-            hidden,
-        )?;
+        let trailing = {
+            let _range = profile::range("engine.rollout.upload_trailing");
+            self.upload_trailing(
+                &inputs.trailing_text,
+                &inputs.tts_pad_embed,
+                max_frames.saturating_sub(1),
+                hidden,
+            )?
+        };
         let cp_prefix = self.runtime.empty_buffer::<f32>(2 * hidden)?;
         let acoustic_sum = self.runtime.empty_buffer::<f32>(hidden)?;
-        let mut semantic = if talker_sampling.do_sample {
-            self.talker.prefill_token_with_sampling(
-                &prefill,
-                inputs.prefill_steps,
-                talker_sampling,
-                &mut rng_state,
-            )?
-        } else {
-            self.talker.prefill_token(&prefill, inputs.prefill_steps)?
+        let mut semantic = {
+            let _range = profile::range("engine.rollout.talker_prefill");
+            if talker_sampling.do_sample {
+                self.talker.prefill_token_with_sampling(
+                    &prefill,
+                    inputs.prefill_steps,
+                    talker_sampling,
+                    &mut rng_state,
+                )?
+            } else {
+                self.talker.prefill_token(&prefill, inputs.prefill_steps)?
+            }
         };
         let mut codes = Vec::with_capacity(max_frames * self.code_groups);
         let mut semantic_history = Vec::with_capacity(max_frames);
@@ -272,31 +285,43 @@ impl HipTtsEngine {
                 ended_by_eos = true;
                 break;
             }
-            self.talker.prepare_code_predictor_prefix(&cp_prefix)?;
-            let acoustic = self.predictor.generate_to_buffer_with_options(
-                &cp_prefix,
-                &acoustic_sum,
-                subtalker_sampling,
-                &mut rng_state,
-            )?;
+            {
+                let _range = profile::range("engine.rollout.prepare_code_predictor_prefix");
+                self.talker.prepare_code_predictor_prefix(&cp_prefix)?;
+            }
+            let acoustic = {
+                let _range = profile::range("engine.rollout.code_predictor");
+                self.predictor.generate_to_buffer_with_options(
+                    &cp_prefix,
+                    &acoustic_sum,
+                    subtalker_sampling,
+                    &mut rng_state,
+                )?
+            };
             codes.push(semantic);
             codes.extend(acoustic);
             semantic_history.push(semantic);
             if frame + 1 < max_frames {
-                self.talker
-                    .build_step_input(&acoustic_sum, &trailing[frame])?;
-                semantic = if repetition_penalty != 1.0 || talker_sampling.do_sample {
-                    let previous = self.runtime.buffer_from_slice(&semantic_history)?;
-                    self.talker.decode_prepared_token_with_options(
-                        inputs.prefill_steps + frame,
-                        &previous,
-                        repetition_penalty,
-                        talker_sampling,
-                        &mut rng_state,
-                    )?
-                } else {
+                {
+                    let _range = profile::range("engine.rollout.build_step_input");
                     self.talker
-                        .decode_prepared_token(inputs.prefill_steps + frame)?
+                        .build_step_input(&acoustic_sum, &trailing[frame])?;
+                }
+                semantic = {
+                    let _range = profile::range("engine.rollout.talker_decode");
+                    if repetition_penalty != 1.0 || talker_sampling.do_sample {
+                        let previous = self.runtime.buffer_from_slice(&semantic_history)?;
+                        self.talker.decode_prepared_token_with_options(
+                            inputs.prefill_steps + frame,
+                            &previous,
+                            repetition_penalty,
+                            talker_sampling,
+                            &mut rng_state,
+                        )?
+                    } else {
+                        self.talker
+                            .decode_prepared_token(inputs.prefill_steps + frame)?
+                    }
                 };
             }
         }

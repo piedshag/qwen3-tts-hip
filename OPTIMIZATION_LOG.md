@@ -261,3 +261,89 @@ and 1 warmup iteration, excluding model load:
 
 These use the same streaming/Qwen-default generation settings, but sampling means the
 exact output lengths can differ unless the sampling RNGs are matched exactly.
+
+### ROCProfiler Stage Attribution
+
+Added optional ROCTx ranges behind `QWEN3_HIP_ROCTX=1` and profiled with
+`rocprofv3 --marker-trace --kernel-trace --memory-copy-trace --kernel-rename`.
+The installed `rocprofv3` needed `libhsa-amd-aqlprofile64.so.1`; a Torch wheel had
+the same SONAME under an unversioned filename, so a temporary symlink under
+`/tmp/opencode/rocm-prof-libs` was used for profiling.
+
+Engine profile, 0.6B Qwen-default sampling, 1 warmup and 1 measured iteration:
+
+| Renamed kernel range | Kernel time share |
+| --- | ---: |
+| `engine.rollout.code_predictor` | `54.75%` |
+| `engine.rollout.talker_decode` | `19.95%` |
+| `codec.decoder.causal_conv` | `12.38%` |
+| `codec.decoder.transconv` | `11.01%` |
+| `engine.rollout.talker_prefill` | `1.04%` |
+
+Codec-focused profile, codes generated once, 1 warmup decode and 3 measured decodes:
+
+| Renamed kernel range | Kernel time share |
+| --- | ---: |
+| `engine.rollout.code_predictor` | `31.65%` |
+| `codec.decoder.causal_conv` | `28.87%` |
+| `codec.decoder.transconv` | `25.62%` |
+| `engine.rollout.talker_decode` | `11.52%` |
+
+The codec benchmark still includes one code-generation pass, but repeated decode makes
+the codec decoder kernels clear. `codec.decoder.transconv` is only 16 calls in the
+codec-focused profile and averages `28.84 ms` per dispatch, while
+`codec.decoder.causal_conv` averages `5.00 ms` over 104 dispatches. The next codec
+optimization target should be `codec_transconv1d_channels_f32`, followed by
+`codec_causal_conv1d_dilated_f32`.
+
+### Tiled Codec Kernel Experiment
+
+Tried optional tiled/reduction kernels for decoder transposed convolution and causal
+convolution. They parallelized each output across 16 reduction lanes and 16 output
+channels per block, and are available only when `QWEN3_HIP_TILED_CODEC=1`.
+
+Correctness passed full waveform parity:
+
+```text
+max_abs=0.000002561, mean_abs=0.000000056
+```
+
+Performance regressed, so the original kernels remain the default:
+
+| Path | Decode Mean | Decode RTF | E2E RTF |
+| --- | ---: | ---: | ---: |
+| Original default | `0.284988s` | `0.104775` | `0.542482` |
+| Tiled experiment | `0.466068s` | `0.171349` | `0.607684` |
+
+Discovery: a simple block-level reduction adds too much scheduling/reduction overhead.
+The next transposed-convolution attempt should use a GEMM-style formulation with
+prepacked per-phase weights, not one block per small output tile.
+
+### GEMM Transposed Convolution
+
+Reformulated decoder transposed convolution by phase. For output phase `p`, the
+kernel has two contributing taps, `p` and `p + stride`:
+
+```text
+output[t * stride + p] = input[t] @ W[p] + input[t - 1] @ W[p + stride] + bias
+```
+
+Weights are prepacked per phase at load time. Runtime decode transposes the input to
+time-major form, builds a one-frame-shifted copy, runs two rocBLAS GEMMs per phase,
+then scatters the summed phase output back to channel-major waveform-decoder layout.
+
+Correctness passed waveform parity:
+
+```text
+max_abs=0.000002727, mean_abs=0.000000064
+```
+
+Release benchmark, Qwen-default sampling, 0.6B, 34 frames:
+
+| Path | Decode Mean | Decode RTF | E2E RTF |
+| --- | ---: | ---: | ---: |
+| Direct transconv default before | `0.285582s` | `0.104993` | `0.542482` |
+| GEMM transconv | `0.184353s` | `0.067777` | `0.503268` |
+
+GEMM transconv is now the default. Set `QWEN3_HIP_DIRECT_TRANSCONV=1` to use the old
+direct kernel path for comparison.
