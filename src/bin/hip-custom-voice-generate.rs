@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use qwen3_hip_runtime::codec::write_wav;
 use qwen3_hip_runtime::generation::{GenerateOptions, HipTtsEngine, Language, Speaker};
 use qwen3_hip_runtime::{Error, Result};
 
@@ -43,49 +45,94 @@ fn main() -> Result<()> {
         ));
     }
 
+    let load_start = Instant::now();
     let engine = HipTtsEngine::load_with_max_frames(&model_dir, 0, max_frames)?;
-    let speech = engine.generate(
+    engine.runtime().synchronize()?;
+    let load_seconds = load_start.elapsed().as_secs_f64();
+
+    let generation_start = Instant::now();
+    let generated = engine.generate_codes(
         &text,
         GenerateOptions {
             speaker,
             language,
             max_frames,
-            decode_audio: output_wav.is_some(),
+            decode_audio: false,
         },
     )?;
+    let generation_seconds = generation_start.elapsed().as_secs_f64();
 
     if let Some(path) = reference_codes.as_deref() {
         let expected = load_expected_codes(path)?;
-        if expected.len() < speech.codes.len() {
+        if expected.len() < generated.codes.len() {
             return Err(Error::InvalidInput(format!(
                 "reference has {} codes but generated {}",
                 expected.len(),
-                speech.codes.len()
+                generated.codes.len()
             )));
         }
-        if speech.codes != expected[..speech.codes.len()] {
+        if generated.codes != expected[..generated.codes.len()] {
             return Err(Error::InvalidInput(format!(
                 "generated codes mismatch: actual={:?}, expected={:?}",
-                speech.codes,
-                &expected[..speech.codes.len()]
+                generated.codes,
+                &expected[..generated.codes.len()]
             )));
         }
     }
 
+    let mut samples = Vec::new();
+    let mut decode_seconds = None;
+    let mut write_seconds = None;
     if let Some(path) = output_wav.as_deref() {
-        speech.write_wav(path, wav_gain)?;
+        let decode_start = Instant::now();
+        samples = engine.decode_codes(&generated.codes)?;
+        decode_seconds = Some(decode_start.elapsed().as_secs_f64());
+
+        let write_start = Instant::now();
+        write_wav(
+            path,
+            &samples,
+            qwen3_hip_runtime::generation::SAMPLE_RATE,
+            wav_gain,
+        )?;
+        write_seconds = Some(write_start.elapsed().as_secs_f64());
     }
 
+    let audio_seconds = (!samples.is_empty())
+        .then_some(samples.len() as f64 / qwen3_hip_runtime::generation::SAMPLE_RATE as f64);
+    let inference_seconds = generation_seconds + decode_seconds.unwrap_or(0.0);
     println!(
-        "HIP custom voice generate OK: text={text:?}, speaker={speaker:?}, language={language:?}, frames={}, ended_by_eos={}, samples={}, output_wav={:?}, first_frame={:?}, last_frame={:?}",
-        speech.frames,
-        speech.ended_by_eos,
-        speech.samples.len(),
+        "HIP custom voice generate OK: text={text:?}, speaker={speaker:?}, language={language:?}, frames={}, ended_by_eos={}, samples={}, output_wav={:?}, load_seconds={load_seconds:.6}, generation_seconds={generation_seconds:.6}, decode_seconds={}, write_seconds={}, inference_seconds={inference_seconds:.6}, audio_seconds={}, generation_rtf={}, decode_rtf={}, inference_rtf={}, first_frame={:?}, last_frame={:?}",
+        generated.frames,
+        generated.ended_by_eos,
+        samples.len(),
         output_wav,
-        &speech.codes[..CODE_GROUPS.min(speech.codes.len())],
-        &speech.codes[speech.codes.len().saturating_sub(CODE_GROUPS)..]
+        format_optional_seconds(decode_seconds),
+        format_optional_seconds(write_seconds),
+        format_optional_seconds(audio_seconds),
+        format_optional_rtf(generation_seconds, audio_seconds),
+        format_optional_rtf(
+            decode_seconds.unwrap_or(0.0),
+            audio_seconds.filter(|_| decode_seconds.is_some())
+        ),
+        format_optional_rtf(inference_seconds, audio_seconds),
+        &generated.codes[..CODE_GROUPS.min(generated.codes.len())],
+        &generated.codes[generated.codes.len().saturating_sub(CODE_GROUPS)..]
     );
     Ok(())
+}
+
+fn format_optional_seconds(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| "n/a".to_string())
+}
+
+fn format_optional_rtf(seconds: f64, audio_seconds: Option<f64>) -> String {
+    audio_seconds
+        .filter(|audio_seconds| *audio_seconds > 0.0)
+        .map(|audio_seconds| format!("{:.6}", seconds / audio_seconds))
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 fn load_expected_codes(path: &Path) -> Result<Vec<i32>> {
