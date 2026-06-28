@@ -12,6 +12,7 @@ normal callers should use `HipTtsEngine`.
 - Optimize Qwen3-TTS inference performance for AMD ROCm/HIP systems.
 - Keep dependencies minimal and avoid framework lock-in.
 - Remove as many layers as possible between the runtime and the hardware.
+- Make streaming generation and audio output a top priority.
 
 ## Status
 
