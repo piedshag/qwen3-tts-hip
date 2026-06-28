@@ -7,6 +7,12 @@ rocBLAS GEMMs, HIPRTC compilation, and a native HIP codec decoder. The lower-lev
 GPU/model/audio modules are still public for diagnostics and experimentation, but
 normal callers should use `HipTtsEngine`.
 
+## Goals
+
+- Optimize Qwen3-TTS inference performance for AMD ROCm/HIP systems.
+- Keep dependencies minimal and avoid framework lock-in.
+- Remove as many layers as possible between the runtime and the hardware.
+
 ## Status
 
 - Supports Qwen3-TTS 12 Hz CustomVoice 0.6B and basic 1.7B loading/generation.
@@ -36,23 +42,23 @@ export LD_LIBRARY_PATH="/opt/rocm/lib:/opt/rocm-7.2.4/lib:${LD_LIBRARY_PATH}"
 ```rust,no_run
 use qwen3_hip_runtime::{GenerateOptions, HipTtsEngine, Language, Speaker};
 
-# fn main() -> qwen3_hip_runtime::Result<()> {
-let model_dir = "/path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice";
-let engine = HipTtsEngine::load_with_max_frames(model_dir, 0, 240)?;
+fn main() -> qwen3_hip_runtime::Result<()> {
+    let model_dir = "/path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice";
+    let engine = HipTtsEngine::load_with_max_frames(model_dir, 0, 240)?;
 
-let speech = engine.generate(
-    "She said she would be here by noon.",
-    GenerateOptions {
-        speaker: Speaker::Ryan,
-        language: Language::English,
-        max_frames: 240,
-        decode_audio: true,
-    },
-)?;
+    let speech = engine.generate(
+        "She said she would be here by noon.",
+        GenerateOptions {
+            speaker: Speaker::Ryan,
+            language: Language::English,
+            max_frames: 240,
+            decode_audio: true,
+        },
+    )?;
 
-speech.write_wav("out.wav", 1.0)?;
-# Ok(())
-# }
+    speech.write_wav("out.wav", 1.0)?;
+    Ok(())
+}
 ```
 
 If you need a fixed KV-cache capacity independent of a single request's frame cap,
