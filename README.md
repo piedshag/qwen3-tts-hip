@@ -11,16 +11,17 @@ normal callers should use `HipTtsEngine`.
 
 - Optimize Qwen3-TTS inference performance for AMD ROCm/HIP systems.
 - Keep dependencies minimal and avoid framework lock-in.
-- Remove as many layers as possible between the runtime and the hardware.
-- Make streaming generation and audio output a top priority.
+- Make streaming support a top priority.
 
 ## Status
 
 - Supports Qwen3-TTS 12 Hz CustomVoice 0.6B and basic 1.7B loading/generation.
 - 0.6B deterministic generation matches exported Python fixtures exactly.
 - Native HIP codec waveform parity passes against Python codec-stage fixtures.
-- Hot 0.6B end-to-end generation on the local R9700 test system is about `0.43` RTF.
-- Hot 1.7B 39-frame e2e benchmark is about `0.52` RTF, but EOS/stopping behavior still needs more parity work.
+- Hot 0.6B streaming generation with Qwen-default sampling is about `0.54` RTF on the local R9700 test system.
+- The matching Python streaming/Qwen-default path measured about `1.91` RTF on the same system.
+- The optimized deterministic greedy 0.6B path is about `0.41` RTF.
+- The optimized deterministic greedy 1.7B 39-frame benchmark is about `0.50` RTF, but EOS/stopping behavior still needs more parity work.
 
 ## Requirements
 
@@ -54,6 +55,16 @@ fn main() -> qwen3_hip_runtime::Result<()> {
             language: Language::English,
             max_frames: 240,
             decode_audio: true,
+            do_sample: true,
+            top_k: 50,
+            top_p: 1.0,
+            temperature: 0.9,
+            repetition_penalty: 1.05,
+            subtalker_dosample: true,
+            subtalker_top_k: 50,
+            subtalker_top_p: 1.0,
+            subtalker_temperature: 0.9,
+            seed: 0,
         },
     )?;
 
@@ -78,18 +89,44 @@ cargo run --profile timing --bin hip-custom-voice-generate -- \
   Ryan \
   English \
   /tmp/qwen3-tts.wav \
-  1.0
+  1.0 \
+  1.05 \
+  true \
+  50 \
+  1.0 \
+  0.9 \
+  true \
+  50 \
+  1.0 \
+  0.9 \
+  0
 ```
 
 Argument order:
 
 ```text
-model_dir text max_frames reference_codes speaker language output_wav wav_gain
+model_dir text max_frames reference_codes speaker language output_wav wav_gain repetition_penalty do_sample top_k top_p temperature subtalker_dosample subtalker_top_k subtalker_top_p subtalker_temperature seed
 ```
 
 Use `none` or `-` for `reference_codes` when not checking exact fixture parity.
+Generation options are optional and default to the Qwen TTS generation defaults:
+`do_sample=true`, `top_k=50`, `top_p=1.0`, `temperature=0.9`,
+`repetition_penalty=1.05`, `subtalker_dosample=true`, `subtalker_top_k=50`,
+`subtalker_top_p=1.0`, and `subtalker_temperature=0.9`.
 
-Run a hot e2e benchmark:
+Run a hot e2e benchmark for the public `HipTtsEngine` path and Qwen-default
+generation settings:
+
+```bash
+cargo run --release --bin hip-engine-bench -- \
+  /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  "She said she would be here by noon." \
+  240 \
+  3 \
+  1
+```
+
+Run the lower-level deterministic greedy e2e benchmark:
 
 ```bash
 cargo run --profile timing --bin hip-e2e-bench -- \
@@ -99,6 +136,18 @@ cargo run --profile timing --bin hip-e2e-bench -- \
   3 \
   1
 ```
+
+Run the small standard-library web server:
+
+```bash
+cargo run --release --bin tts-server -- \
+  /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice \
+  127.0.0.1:8080 \
+  240
+```
+
+Open `http://127.0.0.1:8080/`. The page generates WAV audio and reports timing
+statistics such as generation time, decode time, audio duration, and RTF.
 
 ## Python Parity Fixtures
 

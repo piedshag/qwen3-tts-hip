@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 use std::path::Path;
+use std::time::Instant;
 
 use safetensors::SafeTensors;
 
@@ -28,6 +29,48 @@ pub struct DecodeStepDims {
     pub epsilon: f32,
     pub theta: f32,
     pub scale: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DecodeStepProfile {
+    pub input_norm_seconds: f64,
+    pub qkv_gemm_seconds: f64,
+    pub qk_layout_cache_seconds: f64,
+    pub attention_seconds: f64,
+    pub output_gemm_residual_seconds: f64,
+    pub post_norm_seconds: f64,
+    pub gate_up_gemm_seconds: f64,
+    pub swiglu_seconds: f64,
+    pub down_gemm_residual_seconds: f64,
+    pub final_copy_seconds: f64,
+}
+
+impl DecodeStepProfile {
+    pub fn total_seconds(&self) -> f64 {
+        self.input_norm_seconds
+            + self.qkv_gemm_seconds
+            + self.qk_layout_cache_seconds
+            + self.attention_seconds
+            + self.output_gemm_residual_seconds
+            + self.post_norm_seconds
+            + self.gate_up_gemm_seconds
+            + self.swiglu_seconds
+            + self.down_gemm_residual_seconds
+            + self.final_copy_seconds
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.input_norm_seconds += other.input_norm_seconds;
+        self.qkv_gemm_seconds += other.qkv_gemm_seconds;
+        self.qk_layout_cache_seconds += other.qk_layout_cache_seconds;
+        self.attention_seconds += other.attention_seconds;
+        self.output_gemm_residual_seconds += other.output_gemm_residual_seconds;
+        self.post_norm_seconds += other.post_norm_seconds;
+        self.gate_up_gemm_seconds += other.gate_up_gemm_seconds;
+        self.swiglu_seconds += other.swiglu_seconds;
+        self.down_gemm_residual_seconds += other.down_gemm_residual_seconds;
+        self.final_copy_seconds += other.final_copy_seconds;
+    }
 }
 
 pub struct DecodeStepLayer {
@@ -133,9 +176,6 @@ struct DecodeWorkspace {
     qkv_proj: DeviceBuffer<f32>,
     q_norm: DeviceBuffer<f32>,
     k_norm: DeviceBuffer<f32>,
-    q_bhsd: DeviceBuffer<f32>,
-    k_bhsd: DeviceBuffer<f32>,
-    v_bhsd: DeviceBuffer<f32>,
     q_rope: DeviceBuffer<f32>,
     k_rope: DeviceBuffer<f32>,
     scores: DeviceBuffer<f32>,
@@ -580,33 +620,9 @@ impl DecodeStepLayer {
             d.head_dim,
             d.epsilon,
         )?;
-        launch_permute(
-            &k.permute,
-            w.q_norm.as_ptr(),
-            w.q_bhsd.as_mut_ptr(),
-            1,
-            d.q_heads,
-            d.head_dim,
-        )?;
-        launch_permute(
-            &k.permute,
-            w.k_norm.as_ptr(),
-            w.k_bhsd.as_mut_ptr(),
-            1,
-            d.kv_heads,
-            d.head_dim,
-        )?;
-        launch_permute(
-            &k.permute,
-            v_proj,
-            w.v_bhsd.as_mut_ptr(),
-            1,
-            d.kv_heads,
-            d.head_dim,
-        )?;
         launch_rope(
             &k.rope,
-            w.q_bhsd.as_ptr(),
+            w.q_norm.as_ptr(),
             w.q_rope.as_mut_ptr(),
             d.q_out,
             d.q_heads,
@@ -617,7 +633,7 @@ impl DecodeStepLayer {
         )?;
         launch_rope(
             &k.rope,
-            w.k_bhsd.as_ptr(),
+            w.k_norm.as_ptr(),
             w.k_rope.as_mut_ptr(),
             d.kv_out,
             d.kv_heads,
@@ -638,7 +654,7 @@ impl DecodeStepLayer {
         )?;
         launch_write_cache(
             &k.write_cache,
-            w.v_bhsd.as_ptr(),
+            v_proj,
             w.v_cache.as_mut_ptr(),
             d.kv_heads,
             1,
@@ -878,6 +894,12 @@ impl DecodeStepStack {
                 output.len()
             )));
         }
+        if offset >= self.dims.max_cache_steps {
+            return Err(Error::InvalidInput(format!(
+                "offset {offset} outside cache length {}",
+                self.dims.max_cache_steps
+            )));
+        }
         if self.weights.len() == 1 {
             return self.decode_step_layer_on_stream(
                 input,
@@ -976,6 +998,80 @@ impl DecodeStepStack {
             output.copy_from_device(&self.current_scratch)?;
         }
         Ok(())
+    }
+
+    pub fn decode_step_profiled(
+        &self,
+        runtime: &HipRuntime,
+        input: &DeviceBuffer<f32>,
+        output: &DeviceBuffer<f32>,
+        offset: usize,
+    ) -> Result<DecodeStepProfile> {
+        if input.len() != self.dims.hidden || output.len() != self.dims.hidden {
+            return Err(Error::InvalidInput(format!(
+                "decode input/output length must be {}, got input={}, output={}",
+                self.dims.hidden,
+                input.len(),
+                output.len()
+            )));
+        }
+        if offset >= self.dims.max_cache_steps {
+            return Err(Error::InvalidInput(format!(
+                "offset {offset} outside cache length {}",
+                self.dims.max_cache_steps
+            )));
+        }
+        let mut profile = DecodeStepProfile::default();
+        if self.weights.len() == 1 {
+            profile.add(&self.decode_step_layer_profiled(
+                runtime,
+                input,
+                output,
+                &self.weights[0],
+                &self.caches[0],
+                offset,
+            )?);
+            return Ok(profile);
+        }
+
+        profile.add(&self.decode_step_layer_profiled(
+            runtime,
+            input,
+            &self.current_scratch,
+            &self.weights[0],
+            &self.caches[0],
+            offset,
+        )?);
+        let mut current_is_scratch = true;
+        for (weights, cache) in self.weights.iter().zip(self.caches.iter()).skip(1) {
+            if current_is_scratch {
+                profile.add(&self.decode_step_layer_profiled(
+                    runtime,
+                    &self.current_scratch,
+                    output,
+                    weights,
+                    cache,
+                    offset,
+                )?);
+            } else {
+                profile.add(&self.decode_step_layer_profiled(
+                    runtime,
+                    output,
+                    &self.current_scratch,
+                    weights,
+                    cache,
+                    offset,
+                )?);
+            }
+            current_is_scratch = !current_is_scratch;
+        }
+        if current_is_scratch {
+            let start = Instant::now();
+            output.copy_from_device(&self.current_scratch)?;
+            runtime.synchronize()?;
+            profile.final_copy_seconds += start.elapsed().as_secs_f64();
+        }
+        Ok(profile)
     }
 
     fn prefill_forward(
@@ -1251,33 +1347,9 @@ impl DecodeStepStack {
             d.head_dim,
             d.epsilon,
         )?;
-        launch_permute(
-            &k.permute,
-            w.q_norm.as_ptr(),
-            w.q_bhsd.as_mut_ptr(),
-            1,
-            d.q_heads,
-            d.head_dim,
-        )?;
-        launch_permute(
-            &k.permute,
-            w.k_norm.as_ptr(),
-            w.k_bhsd.as_mut_ptr(),
-            1,
-            d.kv_heads,
-            d.head_dim,
-        )?;
-        launch_permute(
-            &k.permute,
-            v_proj,
-            w.v_bhsd.as_mut_ptr(),
-            1,
-            d.kv_heads,
-            d.head_dim,
-        )?;
         launch_rope(
             &k.rope,
-            w.q_bhsd.as_ptr(),
+            w.q_norm.as_ptr(),
             w.q_rope.as_mut_ptr(),
             d.q_out,
             d.q_heads,
@@ -1288,7 +1360,7 @@ impl DecodeStepStack {
         )?;
         launch_rope(
             &k.rope,
-            w.k_bhsd.as_ptr(),
+            w.k_norm.as_ptr(),
             w.k_rope.as_mut_ptr(),
             d.kv_out,
             d.kv_heads,
@@ -1309,7 +1381,7 @@ impl DecodeStepStack {
         )?;
         launch_write_cache(
             &k.write_cache,
-            w.v_bhsd.as_ptr(),
+            v_proj,
             cache.v_cache.as_mut_ptr(),
             d.kv_heads,
             1,
@@ -1402,6 +1474,223 @@ impl DecodeStepStack {
         )
     }
 
+    fn decode_step_layer_profiled(
+        &self,
+        runtime: &HipRuntime,
+        input: &DeviceBuffer<f32>,
+        output: &DeviceBuffer<f32>,
+        weights: &DecodeDeviceWeights,
+        cache: &DecodeLayerCache,
+        offset: usize,
+    ) -> Result<DecodeStepProfile> {
+        let d = self.dims;
+        let w = &self.workspace;
+        let k = &self.kernels;
+        let active_steps = offset + 1;
+        let mut profile = DecodeStepProfile::default();
+
+        let start = Instant::now();
+        launch_rmsnorm(
+            &k.rmsnorm,
+            input.as_ptr(),
+            weights.input_gamma.as_ptr(),
+            w.normed.as_mut_ptr(),
+            1,
+            d.hidden,
+            d.epsilon,
+        )?;
+        runtime.synchronize()?;
+        profile.input_norm_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        self.blas.sgemm_row_major(
+            &w.normed,
+            &weights.qkv_weight,
+            &w.qkv_proj,
+            1,
+            d.q_out + 2 * d.kv_out,
+            d.hidden,
+        )?;
+        runtime.synchronize()?;
+        profile.qkv_gemm_seconds += start.elapsed().as_secs_f64();
+
+        let q_proj = w.qkv_proj.as_ptr_at(0)?;
+        let k_proj = w.qkv_proj.as_ptr_at(d.q_out)?;
+        let v_proj = w.qkv_proj.as_ptr_at(d.q_out + d.kv_out)?;
+
+        let start = Instant::now();
+        launch_rmsnorm(
+            &k.rmsnorm,
+            q_proj,
+            weights.q_gamma.as_ptr(),
+            w.q_norm.as_mut_ptr(),
+            d.q_heads,
+            d.head_dim,
+            d.epsilon,
+        )?;
+        launch_rmsnorm(
+            &k.rmsnorm,
+            k_proj,
+            weights.k_gamma.as_ptr(),
+            w.k_norm.as_mut_ptr(),
+            d.kv_heads,
+            d.head_dim,
+            d.epsilon,
+        )?;
+        launch_rope(
+            &k.rope,
+            w.q_norm.as_ptr(),
+            w.q_rope.as_mut_ptr(),
+            d.q_out,
+            d.q_heads,
+            1,
+            d.head_dim,
+            offset,
+            d.theta,
+        )?;
+        launch_rope(
+            &k.rope,
+            w.k_norm.as_ptr(),
+            w.k_rope.as_mut_ptr(),
+            d.kv_out,
+            d.kv_heads,
+            1,
+            d.head_dim,
+            offset,
+            d.theta,
+        )?;
+        launch_write_cache(
+            &k.write_cache,
+            w.k_rope.as_ptr(),
+            cache.k_cache.as_mut_ptr(),
+            d.kv_heads,
+            1,
+            d.max_cache_steps,
+            d.head_dim,
+            offset,
+        )?;
+        launch_write_cache(
+            &k.write_cache,
+            v_proj,
+            cache.v_cache.as_mut_ptr(),
+            d.kv_heads,
+            1,
+            d.max_cache_steps,
+            d.head_dim,
+            offset,
+        )?;
+        runtime.synchronize()?;
+        profile.qk_layout_cache_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        launch_attention_scores_cache(
+            &k.scores_cache,
+            w.q_rope.as_ptr(),
+            cache.k_cache.as_ptr(),
+            w.scores.as_mut_ptr(),
+            d.q_heads,
+            d.kv_heads,
+            1,
+            active_steps,
+            d.max_cache_steps,
+            d.head_dim,
+            offset,
+            d.scale,
+        )?;
+        launch_softmax(
+            &k.softmax,
+            w.scores.as_ptr(),
+            w.probs.as_mut_ptr(),
+            d.q_heads,
+            active_steps,
+        )?;
+        launch_apply_value_cache(
+            &k.apply_value_cache,
+            w.probs.as_ptr(),
+            cache.v_cache.as_ptr(),
+            w.attended.as_mut_ptr(),
+            d.q_heads,
+            d.kv_heads,
+            1,
+            active_steps,
+            d.max_cache_steps,
+            d.head_dim,
+        )?;
+        runtime.synchronize()?;
+        profile.attention_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        self.blas.sgemm_row_major(
+            &w.attended,
+            &weights.o_weight,
+            &w.projected,
+            1,
+            d.hidden,
+            d.q_out,
+        )?;
+        launch_ternary(
+            &k.residual_add,
+            input.as_ptr(),
+            w.projected.as_ptr(),
+            w.attention_output.as_mut_ptr(),
+            d.hidden,
+        )?;
+        runtime.synchronize()?;
+        profile.output_gemm_residual_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        launch_rmsnorm(
+            &k.rmsnorm,
+            w.attention_output.as_ptr(),
+            weights.post_attention_gamma.as_ptr(),
+            w.post_norm.as_mut_ptr(),
+            1,
+            d.hidden,
+            d.epsilon,
+        )?;
+        runtime.synchronize()?;
+        profile.post_norm_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        self.blas.sgemm_row_major(
+            &w.post_norm,
+            &weights.gate_up_weight,
+            &w.gate_up,
+            1,
+            2 * d.intermediate,
+            d.hidden,
+        )?;
+        runtime.synchronize()?;
+        profile.gate_up_gemm_seconds += start.elapsed().as_secs_f64();
+
+        let gate = w.gate_up.as_ptr_at(0)?;
+        let up = w.gate_up.as_ptr_at(d.intermediate)?;
+        let start = Instant::now();
+        launch_ternary(&k.swiglu, gate, up, w.swiglu.as_mut_ptr(), d.intermediate)?;
+        runtime.synchronize()?;
+        profile.swiglu_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        self.blas.sgemm_row_major(
+            &w.swiglu,
+            &weights.down_weight,
+            &w.mlp_down,
+            1,
+            d.hidden,
+            d.intermediate,
+        )?;
+        launch_ternary(
+            &k.residual_add,
+            w.attention_output.as_ptr(),
+            w.mlp_down.as_ptr(),
+            output.as_mut_ptr(),
+            d.hidden,
+        )?;
+        runtime.synchronize()?;
+        profile.down_gemm_residual_seconds += start.elapsed().as_secs_f64();
+        Ok(profile)
+    }
+
     fn decode_step_layer_on_stream(
         &self,
         input: &DeviceBuffer<f32>,
@@ -1457,36 +1746,9 @@ impl DecodeStepStack {
             d.epsilon,
             Some(stream),
         )?;
-        launch_permute_on_stream(
-            &k.permute,
-            w.q_norm.as_ptr(),
-            w.q_bhsd.as_mut_ptr(),
-            1,
-            d.q_heads,
-            d.head_dim,
-            Some(stream),
-        )?;
-        launch_permute_on_stream(
-            &k.permute,
-            w.k_norm.as_ptr(),
-            w.k_bhsd.as_mut_ptr(),
-            1,
-            d.kv_heads,
-            d.head_dim,
-            Some(stream),
-        )?;
-        launch_permute_on_stream(
-            &k.permute,
-            v_proj,
-            w.v_bhsd.as_mut_ptr(),
-            1,
-            d.kv_heads,
-            d.head_dim,
-            Some(stream),
-        )?;
         launch_rope_on_stream(
             &k.rope,
-            w.q_bhsd.as_ptr(),
+            w.q_norm.as_ptr(),
             w.q_rope.as_mut_ptr(),
             d.q_out,
             d.q_heads,
@@ -1498,7 +1760,7 @@ impl DecodeStepStack {
         )?;
         launch_rope_on_stream(
             &k.rope,
-            w.k_bhsd.as_ptr(),
+            w.k_norm.as_ptr(),
             w.k_rope.as_mut_ptr(),
             d.kv_out,
             d.kv_heads,
@@ -1521,7 +1783,7 @@ impl DecodeStepStack {
         )?;
         launch_write_cache_on_stream(
             &k.write_cache,
-            w.v_bhsd.as_ptr(),
+            v_proj,
             cache.v_cache.as_mut_ptr(),
             d.kv_heads,
             1,
@@ -1814,9 +2076,6 @@ impl DecodeWorkspace {
             qkv_proj: runtime.empty_buffer::<f32>(d.q_out + 2 * d.kv_out)?,
             q_norm: runtime.empty_buffer::<f32>(d.q_out)?,
             k_norm: runtime.empty_buffer::<f32>(d.kv_out)?,
-            q_bhsd: runtime.empty_buffer::<f32>(d.q_out)?,
-            k_bhsd: runtime.empty_buffer::<f32>(d.kv_out)?,
-            v_bhsd: runtime.empty_buffer::<f32>(d.kv_out)?,
             q_rope: runtime.empty_buffer::<f32>(d.q_out)?,
             k_rope: runtime.empty_buffer::<f32>(d.kv_out)?,
             scores: runtime.empty_buffer::<f32>(d.q_heads * d.max_cache_steps)?,

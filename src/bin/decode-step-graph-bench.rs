@@ -52,6 +52,22 @@ fn main() -> qwen3_hip_runtime::Result<()> {
     let eager_mean_seconds = eager_total_seconds / iterations as f64;
     let eager = eager_dev.copy_to_host()?;
 
+    let profile = stack.decode_step_profiled(&runtime, &current_dev, &output_dev, prefix_steps)?;
+    let profile_total = profile.total_seconds();
+    println!(
+        "Decode-step profile: layers={layer_count}, prefix_steps={prefix_steps}, total_seconds={profile_total:.6}, input_norm={:.6}, qkv_gemm={:.6}, qk_layout_cache={:.6}, attention={:.6}, output_gemm_residual={:.6}, post_norm={:.6}, gate_up_gemm={:.6}, swiglu={:.6}, down_gemm_residual={:.6}, final_copy={:.6}",
+        profile.input_norm_seconds,
+        profile.qkv_gemm_seconds,
+        profile.qk_layout_cache_seconds,
+        profile.attention_seconds,
+        profile.output_gemm_residual_seconds,
+        profile.post_norm_seconds,
+        profile.gate_up_gemm_seconds,
+        profile.swiglu_seconds,
+        profile.down_gemm_residual_seconds,
+        profile.final_copy_seconds,
+    );
+
     stream.begin_capture()?;
     stack.decode_step_on_stream(&current_dev, &output_dev, prefix_steps, &stream)?;
     let graph = stream.end_capture()?;

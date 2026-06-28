@@ -261,6 +261,26 @@ extern "C" __global__ void suppress_codec_logits_f32(
         output[idx] = value;
     }
 }
+
+extern "C" __global__ void apply_repetition_penalty_f32(
+    float* logits,
+    const int* tokens,
+    int token_count,
+    int vocab_size,
+    float penalty
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || penalty == 1.0f) {
+        return;
+    }
+    for (int idx = 0; idx < token_count; ++idx) {
+        int token = tokens[idx];
+        if (token < 0 || token >= vocab_size) {
+            continue;
+        }
+        float value = logits[token];
+        logits[token] = value < 0.0f ? value * penalty : value / penalty;
+    }
+}
 "#;
 
 pub const LAYOUT_F32_SOURCE: &str = r#"

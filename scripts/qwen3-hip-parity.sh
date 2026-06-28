@@ -52,14 +52,42 @@ cargo run --profile "$PROFILE" --bin hip-custom-voice-generate -- \
   "$MODEL_DIR" \
   "$TEXT" \
   12 \
-  "$FIXTURE_ROOT/talker_f32_rollout12/rollout_codes.npy"
+  "$FIXTURE_ROOT/talker_f32_rollout12/rollout_codes.npy" \
+  Ryan \
+  English \
+  - \
+  1.0 \
+  1.0 \
+  false \
+  50 \
+  1.0 \
+  1.0 \
+  false \
+  50 \
+  1.0 \
+  1.0 \
+  0
 
 if [[ "$MODE" == "full" ]]; then
   cargo run --profile "$PROFILE" --bin hip-custom-voice-generate -- \
     "$MODEL_DIR" \
     "$TEXT" \
     39 \
-    "$FIXTURE_ROOT/talker_f32_rollout48/rollout_codes.npy"
+    "$FIXTURE_ROOT/talker_f32_rollout48/rollout_codes.npy" \
+    Ryan \
+    English \
+    - \
+    1.0 \
+    1.0 \
+    false \
+    50 \
+    1.0 \
+    1.0 \
+    false \
+    50 \
+    1.0 \
+    1.0 \
+    0
 
   cargo run --profile "$PROFILE" --bin hip-codec-initial-parity -- \
     "$MODEL_DIR" \

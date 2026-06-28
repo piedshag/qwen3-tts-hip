@@ -6,6 +6,7 @@ use crate::gpu::buffer::DeviceBuffer;
 use crate::gpu::runtime::HipRuntime;
 use crate::model::code_predictor::HipCodePredictor;
 use crate::model::config::Qwen3TtsConfig;
+use crate::model::sampling::SamplingConfig;
 use crate::model::talker::HipTalker;
 use crate::model::text::{CustomVoiceInputs, CustomVoiceTextPrep};
 pub use crate::model::text::{Language, Speaker};
@@ -35,6 +36,16 @@ pub struct GenerateOptions {
     pub language: Language,
     pub max_frames: usize,
     pub decode_audio: bool,
+    pub do_sample: bool,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub temperature: f32,
+    pub repetition_penalty: f32,
+    pub subtalker_dosample: bool,
+    pub subtalker_top_k: usize,
+    pub subtalker_top_p: f32,
+    pub subtalker_temperature: f32,
+    pub seed: u64,
 }
 
 impl Default for GenerateOptions {
@@ -44,6 +55,16 @@ impl Default for GenerateOptions {
             language: Language::English,
             max_frames: 240,
             decode_audio: true,
+            do_sample: true,
+            top_k: 50,
+            top_p: 1.0,
+            temperature: 0.9,
+            repetition_penalty: 1.05,
+            subtalker_dosample: true,
+            subtalker_top_k: 50,
+            subtalker_top_p: 1.0,
+            subtalker_temperature: 0.9,
+            seed: 0,
         }
     }
 }
@@ -156,6 +177,13 @@ impl HipTtsEngine {
                 "max_frames must be non-zero".to_string(),
             ));
         }
+        if options.repetition_penalty <= 0.0 {
+            return Err(Error::InvalidInput(
+                "repetition_penalty must be positive".to_string(),
+            ));
+        }
+        options.talker_sampling().validate("talker")?;
+        options.subtalker_sampling().validate("subtalker")?;
         let inputs = self
             .prep
             .prepare_custom_voice(text, options.speaker, options.language)?;
@@ -166,7 +194,7 @@ impl HipTtsEngine {
                 self.max_cache_steps
             )));
         }
-        let codes = self.rollout(&inputs, options.max_frames)?;
+        let codes = self.rollout(&inputs, &options)?;
         Ok(codes)
     }
 
@@ -206,7 +234,16 @@ impl HipTtsEngine {
         &self.model_dir
     }
 
-    fn rollout(&self, inputs: &CustomVoiceInputs, max_frames: usize) -> Result<GeneratedCodes> {
+    fn rollout(
+        &self,
+        inputs: &CustomVoiceInputs,
+        options: &GenerateOptions,
+    ) -> Result<GeneratedCodes> {
+        let max_frames = options.max_frames;
+        let talker_sampling = options.talker_sampling();
+        let subtalker_sampling = options.subtalker_sampling();
+        let repetition_penalty = options.repetition_penalty;
+        let mut rng_state = options.seed ^ 0x9e37_79b9_7f4a_7c15;
         let hidden = self.talker.hidden_size();
         let prefill = self.runtime.buffer_from_slice(&inputs.prefill)?;
         let trailing = self.upload_trailing(
@@ -217,8 +254,18 @@ impl HipTtsEngine {
         )?;
         let cp_prefix = self.runtime.empty_buffer::<f32>(2 * hidden)?;
         let acoustic_sum = self.runtime.empty_buffer::<f32>(hidden)?;
-        let mut semantic = self.talker.prefill_token(&prefill, inputs.prefill_steps)?;
+        let mut semantic = if talker_sampling.do_sample {
+            self.talker.prefill_token_with_sampling(
+                &prefill,
+                inputs.prefill_steps,
+                talker_sampling,
+                &mut rng_state,
+            )?
+        } else {
+            self.talker.prefill_token(&prefill, inputs.prefill_steps)?
+        };
         let mut codes = Vec::with_capacity(max_frames * self.code_groups);
+        let mut semantic_history = Vec::with_capacity(max_frames);
         let mut ended_by_eos = false;
         for frame in 0..max_frames {
             if semantic == self.codec_eos_token {
@@ -226,17 +273,31 @@ impl HipTtsEngine {
                 break;
             }
             self.talker.prepare_code_predictor_prefix(&cp_prefix)?;
-            let acoustic = self
-                .predictor
-                .generate_to_buffer(&cp_prefix, &acoustic_sum)?;
+            let acoustic = self.predictor.generate_to_buffer_with_options(
+                &cp_prefix,
+                &acoustic_sum,
+                subtalker_sampling,
+                &mut rng_state,
+            )?;
             codes.push(semantic);
             codes.extend(acoustic);
+            semantic_history.push(semantic);
             if frame + 1 < max_frames {
                 self.talker
                     .build_step_input(&acoustic_sum, &trailing[frame])?;
-                semantic = self
-                    .talker
-                    .decode_prepared_token(inputs.prefill_steps + frame)?;
+                semantic = if repetition_penalty != 1.0 || talker_sampling.do_sample {
+                    let previous = self.runtime.buffer_from_slice(&semantic_history)?;
+                    self.talker.decode_prepared_token_with_options(
+                        inputs.prefill_steps + frame,
+                        &previous,
+                        repetition_penalty,
+                        talker_sampling,
+                        &mut rng_state,
+                    )?
+                } else {
+                    self.talker
+                        .decode_prepared_token(inputs.prefill_steps + frame)?
+                };
             }
         }
         self.runtime.synchronize()?;
@@ -268,6 +329,26 @@ impl HipTtsEngine {
             }
         }
         Ok(buffers)
+    }
+}
+
+impl GenerateOptions {
+    fn talker_sampling(&self) -> SamplingConfig {
+        SamplingConfig {
+            do_sample: self.do_sample,
+            top_k: self.top_k,
+            top_p: self.top_p,
+            temperature: self.temperature,
+        }
+    }
+
+    fn subtalker_sampling(&self) -> SamplingConfig {
+        SamplingConfig {
+            do_sample: self.subtalker_dosample,
+            top_k: self.subtalker_top_k,
+            top_p: self.subtalker_top_p,
+            temperature: self.subtalker_temperature,
+        }
     }
 }
 

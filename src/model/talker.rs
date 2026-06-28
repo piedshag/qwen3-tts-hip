@@ -13,6 +13,7 @@ use crate::kernels::{
     ARGMAX_F32_SOURCE, ELEMENTWISE_F32_SOURCE, EMBEDDING_F32_SOURCE, RMSNORM_F32_SOURCE,
     SUPPRESSION_F32_SOURCE,
 };
+use crate::model::sampling::{SamplingConfig, select_token};
 use crate::runtime::HipRuntime;
 use crate::weights::{TensorArchive, tensor_to_f32};
 
@@ -53,6 +54,7 @@ struct TalkerKernels {
     rmsnorm: HipFunction,
     argmax: HipFunction,
     suppress: HipFunction,
+    repetition_penalty: HipFunction,
     embedding_lookup: HipFunction,
     residual_add: HipFunction,
 }
@@ -212,6 +214,23 @@ impl HipTalker {
         self.compute_logits_and_token()
     }
 
+    pub(crate) fn prefill_token_with_sampling(
+        &self,
+        prefill: &DeviceBuffer<f32>,
+        steps: usize,
+        sampling: SamplingConfig,
+        rng_state: &mut u64,
+    ) -> Result<i32> {
+        if steps == 0 {
+            return Err(Error::InvalidInput(
+                "prefill steps must be non-zero".to_string(),
+            ));
+        }
+        self.stack.prefill(prefill, steps)?;
+        self.stack.copy_prefill_step_to(&self.pre_norm, steps - 1)?;
+        self.compute_logits_and_token_with_options(None, 1.0, sampling, rng_state)
+    }
+
     pub fn decode_step_from_host(
         &self,
         runtime: &HipRuntime,
@@ -345,7 +364,76 @@ impl HipTalker {
         self.compute_logits_and_token()
     }
 
+    pub fn decode_prepared_token_with_repetition(
+        &self,
+        offset: usize,
+        previous_tokens: &DeviceBuffer<i32>,
+        repetition_penalty: f32,
+    ) -> Result<i32> {
+        if repetition_penalty <= 0.0 {
+            return Err(Error::InvalidInput(
+                "repetition_penalty must be positive".to_string(),
+            ));
+        }
+        self.stack
+            .decode_step(&self.step_input, &self.pre_norm, offset)?;
+        self.compute_logits_and_token_with_options(
+            Some(previous_tokens),
+            repetition_penalty,
+            SamplingConfig {
+                do_sample: false,
+                top_k: 0,
+                top_p: 1.0,
+                temperature: 1.0,
+            },
+            &mut 0,
+        )
+    }
+
+    pub(crate) fn decode_prepared_token_with_options(
+        &self,
+        offset: usize,
+        previous_tokens: &DeviceBuffer<i32>,
+        repetition_penalty: f32,
+        sampling: SamplingConfig,
+        rng_state: &mut u64,
+    ) -> Result<i32> {
+        if repetition_penalty <= 0.0 {
+            return Err(Error::InvalidInput(
+                "repetition_penalty must be positive".to_string(),
+            ));
+        }
+        self.stack
+            .decode_step(&self.step_input, &self.pre_norm, offset)?;
+        self.compute_logits_and_token_with_options(
+            Some(previous_tokens),
+            repetition_penalty,
+            sampling,
+            rng_state,
+        )
+    }
+
     fn compute_logits_and_token(&self) -> Result<i32> {
+        self.compute_logits_and_token_with_options(
+            None,
+            1.0,
+            SamplingConfig {
+                do_sample: false,
+                top_k: 0,
+                top_p: 1.0,
+                temperature: 1.0,
+            },
+            &mut 0,
+        )
+    }
+
+    fn compute_logits_and_token_with_options(
+        &self,
+        previous_tokens: Option<&DeviceBuffer<i32>>,
+        repetition_penalty: f32,
+        sampling: SamplingConfig,
+        rng_state: &mut u64,
+    ) -> Result<i32> {
         launch_rmsnorm(
             &self.kernels.rmsnorm,
             self.pre_norm.as_ptr(),
@@ -362,6 +450,17 @@ impl HipTalker {
             self.vocab_size,
             self.hidden_size,
         )?;
+        let needs_host_selection =
+            sampling.do_sample || previous_tokens.is_some_and(|tokens| !tokens.is_empty());
+        if let Some(previous_tokens) = previous_tokens.filter(|tokens| !tokens.is_empty()) {
+            launch_repetition_penalty(
+                &self.kernels.repetition_penalty,
+                &self.logits,
+                previous_tokens,
+                self.vocab_size,
+                repetition_penalty,
+            )?;
+        }
         launch_suppress(
             &self.kernels.suppress,
             &self.logits,
@@ -369,6 +468,12 @@ impl HipTalker {
             self.vocab_size,
             self.codec_eos_token,
         )?;
+        if needs_host_selection {
+            let logits = self.suppressed_logits.copy_to_host()?;
+            let token = select_token(&logits, sampling, rng_state)?;
+            self.token.copy_from_host(&[token])?;
+            return Ok(token);
+        }
         launch_argmax(
             &self.kernels.argmax,
             &self.suppressed_logits,
@@ -393,6 +498,7 @@ impl TalkerKernels {
             rmsnorm: rms_module.function("rmsnorm_f32")?,
             argmax: argmax_module.function("argmax_rows_f32")?,
             suppress: suppression_module.function("suppress_codec_logits_f32")?,
+            repetition_penalty: suppression_module.function("apply_repetition_penalty_f32")?,
             embedding_lookup: embedding_module.function("embedding_lookup_f32")?,
             residual_add: elementwise_module.function("residual_add_f32")?,
             _rms_module: rms_module,
@@ -469,6 +575,28 @@ fn launch_suppress(
     let block = 256u32;
     let grid = (vocab_size as u32).div_ceil(block);
     function.launch((grid, 1, 1), (block, 1, 1), 0, &mut params)
+}
+
+fn launch_repetition_penalty(
+    function: &HipFunction,
+    logits: &DeviceBuffer<f32>,
+    tokens: &DeviceBuffer<i32>,
+    vocab_size: usize,
+    penalty: f32,
+) -> Result<()> {
+    let mut logits_ptr = logits.as_mut_ptr();
+    let mut tokens_ptr = tokens.as_ptr();
+    let mut token_count_i32 = tokens.len() as i32;
+    let mut vocab_size_i32 = vocab_size as i32;
+    let mut penalty = penalty;
+    let mut params = [
+        &mut logits_ptr as *mut *mut c_void as *mut c_void,
+        &mut tokens_ptr as *mut *const c_void as *mut c_void,
+        &mut token_count_i32 as *mut i32 as *mut c_void,
+        &mut vocab_size_i32 as *mut i32 as *mut c_void,
+        &mut penalty as *mut f32 as *mut c_void,
+    ];
+    function.launch((1, 1, 1), (1, 1, 1), 0, &mut params)
 }
 
 fn launch_embedding_lookup(

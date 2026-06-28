@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::Path;
 
@@ -8,10 +9,13 @@ use crate::buffer::DeviceBuffer;
 use crate::config::Qwen3TtsConfig;
 use crate::decode::DecodeStepStack;
 use crate::error::{Error, Result};
+use crate::graph::{HipGraphExec, HipStream};
 use crate::kernel::{HipFunction, HipModule};
 use crate::kernels::{ARGMAX_F32_SOURCE, EMBEDDING_F32_SOURCE, RMSNORM_F32_SOURCE};
+use crate::model::sampling::{SamplingConfig, select_token};
 use crate::runtime::HipRuntime;
 use crate::weights::{TensorArchive, tensor_to_f32};
+use std::time::Instant;
 
 const CODE_PREDICTOR_PREFIX: &str = "talker.code_predictor";
 
@@ -44,6 +48,33 @@ pub struct CodePrediction {
     pub embedding_sum: Vec<f32>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct CodePredictorProfile {
+    pub prefix_projection_seconds: f64,
+    pub stack_prefill_seconds: f64,
+    pub first_logits_seconds: f64,
+    pub first_token_seconds: f64,
+    pub remaining_projection_seconds: f64,
+    pub remaining_stack_seconds: f64,
+    pub remaining_logits_seconds: f64,
+    pub remaining_token_seconds: f64,
+    pub output_copy_seconds: f64,
+}
+
+impl CodePredictorProfile {
+    pub fn total_seconds(&self) -> f64 {
+        self.prefix_projection_seconds
+            + self.stack_prefill_seconds
+            + self.first_logits_seconds
+            + self.first_token_seconds
+            + self.remaining_projection_seconds
+            + self.remaining_stack_seconds
+            + self.remaining_logits_seconds
+            + self.remaining_token_seconds
+            + self.output_copy_seconds
+    }
+}
+
 pub struct HipCodePredictor {
     config: CodePredictorConfig,
     hidden: usize,
@@ -66,6 +97,8 @@ pub struct HipCodePredictor {
     tokens: DeviceBuffer<i32>,
     current_embedding: DeviceBuffer<f32>,
     embedding_sum: DeviceBuffer<f32>,
+    graph_stream: HipStream,
+    remaining_groups_graph: RefCell<Option<HipGraphExec>>,
 }
 
 struct CodePredictorKernels {
@@ -210,6 +243,8 @@ impl HipCodePredictor {
             tokens: runtime.empty_buffer::<i32>(num_acoustic)?,
             current_embedding: runtime.empty_buffer::<f32>(talker_hidden)?,
             embedding_sum: runtime.empty_buffer::<f32>(talker_hidden)?,
+            graph_stream: runtime.create_stream()?,
+            remaining_groups_graph: RefCell::new(None),
         })
     }
 
@@ -270,6 +305,50 @@ impl HipCodePredictor {
         self.tokens.copy_to_host()
     }
 
+    pub(crate) fn generate_to_buffer_with_options(
+        &self,
+        prefix: &DeviceBuffer<f32>,
+        embedding_sum: &DeviceBuffer<f32>,
+        sampling: SamplingConfig,
+        rng_state: &mut u64,
+    ) -> Result<Vec<i32>> {
+        if embedding_sum.len() != self.talker_hidden {
+            return Err(Error::InvalidInput(format!(
+                "embedding_sum output length must be {}, got {}",
+                self.talker_hidden,
+                embedding_sum.len()
+            )));
+        }
+        if sampling.do_sample {
+            self.generate_inner_sampled(prefix, sampling, rng_state)?;
+        } else {
+            self.generate_inner(prefix)?;
+        }
+        embedding_sum.copy_from_device(&self.embedding_sum)?;
+        self.tokens.copy_to_host()
+    }
+
+    pub fn generate_to_buffer_profiled(
+        &self,
+        runtime: &HipRuntime,
+        prefix: &DeviceBuffer<f32>,
+        embedding_sum: &DeviceBuffer<f32>,
+    ) -> Result<(Vec<i32>, CodePredictorProfile)> {
+        if embedding_sum.len() != self.talker_hidden {
+            return Err(Error::InvalidInput(format!(
+                "embedding_sum output length must be {}, got {}",
+                self.talker_hidden,
+                embedding_sum.len()
+            )));
+        }
+        let mut profile = self.generate_inner_profiled(runtime, prefix)?;
+        let start = Instant::now();
+        embedding_sum.copy_from_device(&self.embedding_sum)?;
+        let tokens = self.tokens.copy_to_host()?;
+        profile.output_copy_seconds += start.elapsed().as_secs_f64();
+        Ok((tokens, profile))
+    }
+
     fn generate_inner(&self, prefix: &DeviceBuffer<f32>) -> Result<()> {
         if prefix.len() != 2 * self.talker_hidden {
             return Err(Error::InvalidInput(format!(
@@ -300,12 +379,150 @@ impl HipCodePredictor {
         self.embedding_sum
             .copy_from_device(&self.current_embedding)?;
 
+        if num_acoustic > 1 {
+            let _ = self.token.copy_to_host()?;
+            self.generate_remaining_groups_graph()?;
+        }
+        Ok(())
+    }
+
+    fn generate_inner_sampled(
+        &self,
+        prefix: &DeviceBuffer<f32>,
+        sampling: SamplingConfig,
+        rng_state: &mut u64,
+    ) -> Result<()> {
+        if prefix.len() != 2 * self.talker_hidden {
+            return Err(Error::InvalidInput(format!(
+                "CodePredictor prefix length must be {}, got {}",
+                2 * self.talker_hidden,
+                prefix.len()
+            )));
+        }
+        let num_acoustic = self.num_acoustic_groups();
+        let stack_prefix = self.project_to_stack(prefix, &self.projected_prefix, 2)?;
+        self.stack.prefill(stack_prefix, 2)?;
+        self.stack.copy_prefill_step_to(&self.prefill_hidden, 1)?;
+        self.logits_for_hidden(&self.prefill_hidden, 0)?;
+        self.sample_current_token(0, sampling, rng_state)?;
+        launch_embedding_lookup(
+            &self.kernels.embedding_lookup,
+            &self.codec_embeddings[0],
+            &self.token,
+            &self.current_embedding,
+            self.talker_hidden,
+        )?;
+        self.embedding_sum
+            .copy_from_device(&self.current_embedding)?;
+
         for group in 1..num_acoustic {
             let stack_embedding =
                 self.project_to_stack(&self.current_embedding, &self.projected_embedding, 1)?;
             self.stack
                 .decode_step(stack_embedding, &self.step_hidden, group + 1)?;
             self.logits_for_hidden(&self.step_hidden, group)?;
+            self.sample_current_token(group, sampling, rng_state)?;
+            launch_embedding_lookup(
+                &self.kernels.embedding_lookup,
+                &self.codec_embeddings[group],
+                &self.token,
+                &self.current_embedding,
+                self.talker_hidden,
+            )?;
+            launch_residual_add_on_stream(
+                &self.kernels.residual_add,
+                self.embedding_sum.as_ptr(),
+                self.current_embedding.as_ptr(),
+                self.embedding_sum.as_mut_ptr(),
+                self.talker_hidden,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn sample_current_token(
+        &self,
+        group: usize,
+        sampling: SamplingConfig,
+        rng_state: &mut u64,
+    ) -> Result<()> {
+        let logits = self.logits.copy_to_host()?;
+        let token = select_token(&logits, sampling, rng_state)?;
+        self.token.copy_from_host(&[token])?;
+        launch_store_token(&self.kernels.store_token, &self.token, &self.tokens, group)
+    }
+
+    fn generate_inner_profiled(
+        &self,
+        runtime: &HipRuntime,
+        prefix: &DeviceBuffer<f32>,
+    ) -> Result<CodePredictorProfile> {
+        if prefix.len() != 2 * self.talker_hidden {
+            return Err(Error::InvalidInput(format!(
+                "CodePredictor prefix length must be {}, got {}",
+                2 * self.talker_hidden,
+                prefix.len()
+            )));
+        }
+        let num_acoustic = self.num_acoustic_groups();
+        let mut profile = CodePredictorProfile::default();
+
+        let start = Instant::now();
+        let stack_prefix = self.project_to_stack(prefix, &self.projected_prefix, 2)?;
+        runtime.synchronize()?;
+        profile.prefix_projection_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        self.stack.prefill(stack_prefix, 2)?;
+        self.stack.copy_prefill_step_to(&self.prefill_hidden, 1)?;
+        runtime.synchronize()?;
+        profile.stack_prefill_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        self.logits_for_hidden(&self.prefill_hidden, 0)?;
+        runtime.synchronize()?;
+        profile.first_logits_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        launch_argmax(
+            &self.kernels.argmax,
+            &self.logits,
+            &self.token,
+            self.config.vocab_size,
+        )?;
+        launch_store_token(&self.kernels.store_token, &self.token, &self.tokens, 0)?;
+        launch_embedding_lookup(
+            &self.kernels.embedding_lookup,
+            &self.codec_embeddings[0],
+            &self.token,
+            &self.current_embedding,
+            self.talker_hidden,
+        )?;
+        self.embedding_sum
+            .copy_from_device(&self.current_embedding)?;
+        runtime.synchronize()?;
+        profile.first_token_seconds += start.elapsed().as_secs_f64();
+
+        for group in 1..num_acoustic {
+            let start = Instant::now();
+            let stack_embedding =
+                self.project_to_stack(&self.current_embedding, &self.projected_embedding, 1)?;
+            runtime.synchronize()?;
+            profile.remaining_projection_seconds += start.elapsed().as_secs_f64();
+
+            let start = Instant::now();
+            self.stack
+                .decode_step(stack_embedding, &self.step_hidden, group + 1)?;
+            runtime.synchronize()?;
+            profile.remaining_stack_seconds += start.elapsed().as_secs_f64();
+
+            let start = Instant::now();
+            self.logits_for_hidden(&self.step_hidden, group)?;
+            runtime.synchronize()?;
+            profile.remaining_logits_seconds += start.elapsed().as_secs_f64();
+
+            let start = Instant::now();
             launch_argmax(
                 &self.kernels.argmax,
                 &self.logits,
@@ -320,12 +537,81 @@ impl HipCodePredictor {
                 &self.current_embedding,
                 self.talker_hidden,
             )?;
-            launch_residual_add(
+            launch_residual_add_on_stream(
                 &self.kernels.residual_add,
                 self.embedding_sum.as_ptr(),
                 self.current_embedding.as_ptr(),
                 self.embedding_sum.as_mut_ptr(),
                 self.talker_hidden,
+                None,
+            )?;
+            runtime.synchronize()?;
+            profile.remaining_token_seconds += start.elapsed().as_secs_f64();
+        }
+        Ok(profile)
+    }
+
+    fn generate_remaining_groups_graph(&self) -> Result<()> {
+        {
+            let mut graph = self.remaining_groups_graph.borrow_mut();
+            if graph.is_none() {
+                self.graph_stream.begin_capture()?;
+                self.enqueue_remaining_groups_on_stream(&self.graph_stream)?;
+                let captured = self.graph_stream.end_capture()?;
+                *graph = Some(captured.instantiate()?);
+            }
+            graph
+                .as_ref()
+                .expect("graph was just initialized")
+                .launch(&self.graph_stream)?;
+        }
+        self.graph_stream.synchronize()
+    }
+
+    fn enqueue_remaining_groups_on_stream(&self, stream: &HipStream) -> Result<()> {
+        for group in 1..self.num_acoustic_groups() {
+            let stack_embedding = self.project_to_stack_on_stream(
+                &self.current_embedding,
+                &self.projected_embedding,
+                1,
+                stream,
+            )?;
+            self.stack.decode_step_on_stream(
+                stack_embedding,
+                &self.step_hidden,
+                group + 1,
+                stream,
+            )?;
+            self.logits_for_hidden_on_stream(&self.step_hidden, group, stream)?;
+            launch_argmax_on_stream(
+                &self.kernels.argmax,
+                &self.logits,
+                &self.token,
+                self.config.vocab_size,
+                Some(stream),
+            )?;
+            launch_store_token_on_stream(
+                &self.kernels.store_token,
+                &self.token,
+                &self.tokens,
+                group,
+                Some(stream),
+            )?;
+            launch_embedding_lookup_on_stream(
+                &self.kernels.embedding_lookup,
+                &self.codec_embeddings[group],
+                &self.token,
+                &self.current_embedding,
+                self.talker_hidden,
+                Some(stream),
+            )?;
+            launch_residual_add_on_stream(
+                &self.kernels.residual_add,
+                self.embedding_sum.as_ptr(),
+                self.current_embedding.as_ptr(),
+                self.embedding_sum.as_mut_ptr(),
+                self.talker_hidden,
+                Some(stream),
             )?;
         }
         Ok(())
@@ -359,6 +645,43 @@ impl HipCodePredictor {
         Ok(output)
     }
 
+    fn project_to_stack_on_stream<'a>(
+        &'a self,
+        input: &'a DeviceBuffer<f32>,
+        output: &'a DeviceBuffer<f32>,
+        rows: usize,
+        stream: &HipStream,
+    ) -> Result<&'a DeviceBuffer<f32>> {
+        if self.talker_hidden == self.hidden {
+            return Ok(input);
+        }
+        let weight = self.projection_weight.as_ref().ok_or_else(|| {
+            Error::InvalidInput("missing CodePredictor projection weight".to_string())
+        })?;
+        let bias = self.projection_bias.as_ref().ok_or_else(|| {
+            Error::InvalidInput("missing CodePredictor projection bias".to_string())
+        })?;
+        self.blas.sgemm_row_major_on_stream(
+            input,
+            weight,
+            output,
+            rows,
+            self.hidden,
+            self.talker_hidden,
+            stream,
+        )?;
+        launch_bias_add_on_stream(
+            &self.kernels.bias_add,
+            output,
+            bias,
+            output,
+            rows,
+            self.hidden,
+            Some(stream),
+        )?;
+        Ok(output)
+    }
+
     fn logits_for_hidden(&self, hidden: &DeviceBuffer<f32>, group: usize) -> Result<()> {
         launch_rmsnorm(
             &self.kernels.rmsnorm,
@@ -375,6 +698,32 @@ impl HipCodePredictor {
             1,
             self.config.vocab_size,
             self.hidden,
+        )
+    }
+
+    fn logits_for_hidden_on_stream(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        group: usize,
+        stream: &HipStream,
+    ) -> Result<()> {
+        launch_rmsnorm_on_stream(
+            &self.kernels.rmsnorm,
+            hidden.as_ptr(),
+            self.norm_gamma.as_ptr(),
+            self.normed.as_mut_ptr(),
+            self.hidden,
+            self.config.epsilon,
+            Some(stream),
+        )?;
+        self.blas.sgemm_row_major_on_stream(
+            &self.normed,
+            &self.lm_heads[group],
+            &self.logits,
+            1,
+            self.config.vocab_size,
+            self.hidden,
+            stream,
         )
     }
 
@@ -438,6 +787,18 @@ fn launch_bias_add(
     rows: usize,
     cols: usize,
 ) -> Result<()> {
+    launch_bias_add_on_stream(function, input, bias, output, rows, cols, None)
+}
+
+fn launch_bias_add_on_stream(
+    function: &HipFunction,
+    input: &DeviceBuffer<f32>,
+    bias: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<f32>,
+    rows: usize,
+    cols: usize,
+    stream: Option<&HipStream>,
+) -> Result<()> {
     let total = rows * cols;
     let mut input_ptr = input.as_ptr();
     let mut bias_ptr = bias.as_ptr();
@@ -453,7 +814,7 @@ fn launch_bias_add(
     ];
     let block = 256u32;
     let grid = (total as u32).div_ceil(block);
-    function.launch((grid, 1, 1), (block, 1, 1), 0, &mut params)
+    function.launch_on_stream((grid, 1, 1), (block, 1, 1), 0, &mut params, stream)
 }
 
 fn launch_rmsnorm(
@@ -463,6 +824,18 @@ fn launch_rmsnorm(
     output: *mut c_void,
     cols: usize,
     epsilon: f32,
+) -> Result<()> {
+    launch_rmsnorm_on_stream(function, input, gamma, output, cols, epsilon, None)
+}
+
+fn launch_rmsnorm_on_stream(
+    function: &HipFunction,
+    input: *const c_void,
+    gamma: *const c_void,
+    output: *mut c_void,
+    cols: usize,
+    epsilon: f32,
+    stream: Option<&HipStream>,
 ) -> Result<()> {
     let mut input = input;
     let mut gamma = gamma;
@@ -479,7 +852,7 @@ fn launch_rmsnorm(
         &mut epsilon as *mut f32 as *mut c_void,
     ];
     let block = 256u32;
-    function.launch((1, 1, 1), (block, 1, 1), block * 4, &mut params)
+    function.launch_on_stream((1, 1, 1), (block, 1, 1), block * 4, &mut params, stream)
 }
 
 fn launch_argmax(
@@ -487,6 +860,16 @@ fn launch_argmax(
     input: &DeviceBuffer<f32>,
     output: &DeviceBuffer<i32>,
     cols: usize,
+) -> Result<()> {
+    launch_argmax_on_stream(function, input, output, cols, None)
+}
+
+fn launch_argmax_on_stream(
+    function: &HipFunction,
+    input: &DeviceBuffer<f32>,
+    output: &DeviceBuffer<i32>,
+    cols: usize,
+    stream: Option<&HipStream>,
 ) -> Result<()> {
     let mut input_ptr = input.as_ptr();
     let mut output_ptr = output.as_mut_ptr();
@@ -500,7 +883,7 @@ fn launch_argmax(
     ];
     let block = 256u32;
     let shared = block * (std::mem::size_of::<f32>() + std::mem::size_of::<i32>()) as u32;
-    function.launch((1, 1, 1), (block, 1, 1), shared, &mut params)
+    function.launch_on_stream((1, 1, 1), (block, 1, 1), shared, &mut params, stream)
 }
 
 fn launch_embedding_lookup(
@@ -509,6 +892,17 @@ fn launch_embedding_lookup(
     token: &DeviceBuffer<i32>,
     output: &DeviceBuffer<f32>,
     cols: usize,
+) -> Result<()> {
+    launch_embedding_lookup_on_stream(function, table, token, output, cols, None)
+}
+
+fn launch_embedding_lookup_on_stream(
+    function: &HipFunction,
+    table: &DeviceBuffer<f32>,
+    token: &DeviceBuffer<i32>,
+    output: &DeviceBuffer<f32>,
+    cols: usize,
+    stream: Option<&HipStream>,
 ) -> Result<()> {
     let mut table_ptr = table.as_ptr();
     let mut token_ptr = token.as_ptr();
@@ -522,7 +916,7 @@ fn launch_embedding_lookup(
     ];
     let block = 256u32;
     let grid = (cols as u32).div_ceil(block);
-    function.launch((grid, 1, 1), (block, 1, 1), 0, &mut params)
+    function.launch_on_stream((grid, 1, 1), (block, 1, 1), 0, &mut params, stream)
 }
 
 fn launch_store_token(
@@ -530,6 +924,16 @@ fn launch_store_token(
     token: &DeviceBuffer<i32>,
     output: &DeviceBuffer<i32>,
     offset: usize,
+) -> Result<()> {
+    launch_store_token_on_stream(function, token, output, offset, None)
+}
+
+fn launch_store_token_on_stream(
+    function: &HipFunction,
+    token: &DeviceBuffer<i32>,
+    output: &DeviceBuffer<i32>,
+    offset: usize,
+    stream: Option<&HipStream>,
 ) -> Result<()> {
     let mut token_ptr = token.as_ptr();
     let mut output_ptr = output.as_mut_ptr();
@@ -539,15 +943,16 @@ fn launch_store_token(
         &mut output_ptr as *mut *mut c_void as *mut c_void,
         &mut offset_i32 as *mut i32 as *mut c_void,
     ];
-    function.launch((1, 1, 1), (1, 1, 1), 0, &mut params)
+    function.launch_on_stream((1, 1, 1), (1, 1, 1), 0, &mut params, stream)
 }
 
-fn launch_residual_add(
+fn launch_residual_add_on_stream(
     function: &HipFunction,
     residual: *const c_void,
     update: *const c_void,
     output: *mut c_void,
     total: usize,
+    stream: Option<&HipStream>,
 ) -> Result<()> {
     let mut residual = residual;
     let mut update = update;
@@ -561,5 +966,5 @@ fn launch_residual_add(
     ];
     let block = 256u32;
     let grid = (total as u32).div_ceil(block);
-    function.launch((grid, 1, 1), (block, 1, 1), 0, &mut params)
+    function.launch_on_stream((grid, 1, 1), (block, 1, 1), 0, &mut params, stream)
 }

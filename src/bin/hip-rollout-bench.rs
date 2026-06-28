@@ -14,6 +14,24 @@ struct NpyF32 {
     data: Vec<f32>,
 }
 
+#[derive(Default)]
+struct RolloutProfile {
+    prefill_seconds: f64,
+    prepare_prefix_seconds: f64,
+    code_predictor_seconds: f64,
+    code_predictor_prefix_projection_seconds: f64,
+    code_predictor_stack_prefill_seconds: f64,
+    code_predictor_first_logits_seconds: f64,
+    code_predictor_first_token_seconds: f64,
+    code_predictor_remaining_projection_seconds: f64,
+    code_predictor_remaining_stack_seconds: f64,
+    code_predictor_remaining_logits_seconds: f64,
+    code_predictor_remaining_token_seconds: f64,
+    code_predictor_output_copy_seconds: f64,
+    build_step_input_seconds: f64,
+    talker_decode_seconds: f64,
+}
+
 fn main() -> qwen3_hip_runtime::Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model_dir = args.next().map(PathBuf::from).unwrap_or_else(|| {
@@ -109,6 +127,49 @@ fn main() -> qwen3_hip_runtime::Result<()> {
     }
     runtime.synchronize()?;
 
+    let (profile_codes, profile) = rollout_profiled(
+        &runtime,
+        &talker,
+        &predictor,
+        &prefill_dev,
+        &cp_prefix,
+        &acoustic_sum,
+        &trailing_devs,
+        prefill_steps,
+        frames,
+    )?;
+    if profile_codes != first {
+        return Err(Error::InvalidInput(
+            "profiled rollout changed generated codes".to_string(),
+        ));
+    }
+    let profile_total = profile.total_seconds();
+    println!(
+        "HIP rollout profile: frames={frames}, prefill_seconds={:.6}, prepare_prefix_seconds={:.6}, code_predictor_seconds={:.6}, build_step_input_seconds={:.6}, talker_decode_seconds={:.6}, total_seconds={profile_total:.6}, prefill_pct={:.2}, prepare_prefix_pct={:.2}, code_predictor_pct={:.2}, build_step_input_pct={:.2}, talker_decode_pct={:.2}",
+        profile.prefill_seconds,
+        profile.prepare_prefix_seconds,
+        profile.code_predictor_seconds,
+        profile.build_step_input_seconds,
+        profile.talker_decode_seconds,
+        profile.percent(profile.prefill_seconds),
+        profile.percent(profile.prepare_prefix_seconds),
+        profile.percent(profile.code_predictor_seconds),
+        profile.percent(profile.build_step_input_seconds),
+        profile.percent(profile.talker_decode_seconds),
+    );
+    println!(
+        "HIP code predictor profile: prefix_projection_seconds={:.6}, stack_prefill_seconds={:.6}, first_logits_seconds={:.6}, first_token_seconds={:.6}, remaining_projection_seconds={:.6}, remaining_stack_seconds={:.6}, remaining_logits_seconds={:.6}, remaining_token_seconds={:.6}, output_copy_seconds={:.6}",
+        profile.code_predictor_prefix_projection_seconds,
+        profile.code_predictor_stack_prefill_seconds,
+        profile.code_predictor_first_logits_seconds,
+        profile.code_predictor_first_token_seconds,
+        profile.code_predictor_remaining_projection_seconds,
+        profile.code_predictor_remaining_stack_seconds,
+        profile.code_predictor_remaining_logits_seconds,
+        profile.code_predictor_remaining_token_seconds,
+        profile.code_predictor_output_copy_seconds,
+    );
+
     let start = Instant::now();
     let mut last = first.clone();
     for _ in 0..iterations {
@@ -161,6 +222,86 @@ fn rollout(
         }
     }
     Ok(generated)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollout_profiled(
+    runtime: &HipRuntime,
+    talker: &HipTalker,
+    predictor: &HipCodePredictor,
+    prefill: &DeviceBuffer<f32>,
+    cp_prefix: &DeviceBuffer<f32>,
+    acoustic_sum: &DeviceBuffer<f32>,
+    trailing: &[DeviceBuffer<f32>],
+    prefill_steps: usize,
+    frames: usize,
+) -> qwen3_hip_runtime::Result<(Vec<i32>, RolloutProfile)> {
+    let mut profile = RolloutProfile::default();
+
+    let start = Instant::now();
+    let mut semantic = talker.prefill_token(prefill, prefill_steps)?;
+    runtime.synchronize()?;
+    profile.prefill_seconds += start.elapsed().as_secs_f64();
+
+    let mut generated = Vec::with_capacity(frames * CODE_GROUPS);
+    for frame in 0..frames {
+        let start = Instant::now();
+        talker.prepare_code_predictor_prefix(cp_prefix)?;
+        runtime.synchronize()?;
+        profile.prepare_prefix_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let (acoustic, predictor_profile) =
+            predictor.generate_to_buffer_profiled(runtime, cp_prefix, acoustic_sum)?;
+        runtime.synchronize()?;
+        profile.code_predictor_seconds += start.elapsed().as_secs_f64();
+        profile.code_predictor_prefix_projection_seconds +=
+            predictor_profile.prefix_projection_seconds;
+        profile.code_predictor_stack_prefill_seconds += predictor_profile.stack_prefill_seconds;
+        profile.code_predictor_first_logits_seconds += predictor_profile.first_logits_seconds;
+        profile.code_predictor_first_token_seconds += predictor_profile.first_token_seconds;
+        profile.code_predictor_remaining_projection_seconds +=
+            predictor_profile.remaining_projection_seconds;
+        profile.code_predictor_remaining_stack_seconds += predictor_profile.remaining_stack_seconds;
+        profile.code_predictor_remaining_logits_seconds +=
+            predictor_profile.remaining_logits_seconds;
+        profile.code_predictor_remaining_token_seconds += predictor_profile.remaining_token_seconds;
+        profile.code_predictor_output_copy_seconds += predictor_profile.output_copy_seconds;
+
+        generated.push(semantic);
+        generated.extend(acoustic);
+        if frame + 1 < frames {
+            let start = Instant::now();
+            talker.build_step_input(acoustic_sum, &trailing[frame])?;
+            runtime.synchronize()?;
+            profile.build_step_input_seconds += start.elapsed().as_secs_f64();
+
+            let start = Instant::now();
+            semantic = talker.decode_prepared_token(prefill_steps + frame)?;
+            runtime.synchronize()?;
+            profile.talker_decode_seconds += start.elapsed().as_secs_f64();
+        }
+    }
+    Ok((generated, profile))
+}
+
+impl RolloutProfile {
+    fn total_seconds(&self) -> f64 {
+        self.prefill_seconds
+            + self.prepare_prefix_seconds
+            + self.code_predictor_seconds
+            + self.build_step_input_seconds
+            + self.talker_decode_seconds
+    }
+
+    fn percent(&self, seconds: f64) -> f64 {
+        let total = self.total_seconds();
+        if total > 0.0 {
+            100.0 * seconds / total
+        } else {
+            0.0
+        }
+    }
 }
 
 fn upload_trailing(

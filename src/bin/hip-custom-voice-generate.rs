@@ -37,8 +37,21 @@ fn main() -> Result<()> {
         .map(|value| value.to_string_lossy().parse::<Language>())
         .transpose()?
         .unwrap_or(Language::English);
-    let output_wav = args.next().map(PathBuf::from);
+    let output_wav = args.next().and_then(|value| {
+        let text = value.to_string_lossy();
+        (!matches!(text.as_ref(), "none" | "-")).then(|| PathBuf::from(value))
+    });
     let wav_gain = parse_f32_arg(args.next(), "wav_gain")?.unwrap_or(1.0);
+    let repetition_penalty = parse_f32_arg(args.next(), "repetition_penalty")?.unwrap_or(1.05);
+    let do_sample = parse_bool_arg(args.next(), "do_sample")?.unwrap_or(true);
+    let top_k = parse_arg(args.next(), "top_k")?.unwrap_or(50);
+    let top_p = parse_f32_arg(args.next(), "top_p")?.unwrap_or(1.0);
+    let temperature = parse_f32_arg(args.next(), "temperature")?.unwrap_or(0.9);
+    let subtalker_dosample = parse_bool_arg(args.next(), "subtalker_dosample")?.unwrap_or(true);
+    let subtalker_top_k = parse_arg(args.next(), "subtalker_top_k")?.unwrap_or(50);
+    let subtalker_top_p = parse_f32_arg(args.next(), "subtalker_top_p")?.unwrap_or(1.0);
+    let subtalker_temperature = parse_f32_arg(args.next(), "subtalker_temperature")?.unwrap_or(0.9);
+    let seed = parse_u64_arg(args.next(), "seed")?.unwrap_or(0);
     if max_frames == 0 {
         return Err(Error::InvalidInput(
             "max_frames must be non-zero".to_string(),
@@ -58,6 +71,16 @@ fn main() -> Result<()> {
             language,
             max_frames,
             decode_audio: false,
+            do_sample,
+            top_k,
+            top_p,
+            temperature,
+            repetition_penalty,
+            subtalker_dosample,
+            subtalker_top_k,
+            subtalker_top_p,
+            subtalker_temperature,
+            seed,
         },
     )?;
     let generation_seconds = generation_start.elapsed().as_secs_f64();
@@ -165,6 +188,29 @@ fn parse_f32_arg(value: Option<std::ffi::OsString>, name: &str) -> Result<Option
                 .parse::<f32>()
                 .map_err(|err| Error::InvalidInput(format!("invalid {name}: {err}")))
         })
+        .transpose()
+}
+
+fn parse_u64_arg(value: Option<std::ffi::OsString>, name: &str) -> Result<Option<u64>> {
+    value
+        .map(|value| {
+            value
+                .to_string_lossy()
+                .parse::<u64>()
+                .map_err(|err| Error::InvalidInput(format!("invalid {name}: {err}")))
+        })
+        .transpose()
+}
+
+fn parse_bool_arg(value: Option<std::ffi::OsString>, name: &str) -> Result<Option<bool>> {
+    value
+        .map(
+            |value| match value.to_string_lossy().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Ok(true),
+                "0" | "false" | "no" | "off" => Ok(false),
+                other => Err(Error::InvalidInput(format!("invalid {name}: {other}"))),
+            },
+        )
         .transpose()
 }
 
