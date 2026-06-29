@@ -10,8 +10,7 @@ normal callers should use `HipTtsEngine`.
 ## Goals
 
 - Optimize Qwen3-TTS inference performance for AMD ROCm/HIP systems.
-- Keep dependencies minimal and avoid framework lock-in.
-- Make streaming support a top priority.
+- Make real-time streaming a top priority.
 
 ## Status
 
@@ -76,78 +75,22 @@ fn main() -> qwen3_hip_runtime::Result<()> {
 If you need a fixed KV-cache capacity independent of a single request's frame cap,
 use `HipTtsEngine::load_with_options(...)` and set `EngineOptions::max_cache_steps`.
 
-## CLI Usage
+For incremental generation, create a persistent stream and pull code or audio chunks:
 
-Generate a WAV:
+```rust,no_run
+use qwen3_hip_runtime::{GenerateOptions, HipTtsEngine};
 
-```bash
-cargo run --profile timing --bin hip-custom-voice-generate -- \
-  /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-  "She said she would be here by noon." \
-  240 \
-  none \
-  Ryan \
-  English \
-  /tmp/qwen3-tts.wav \
-  1.0 \
-  1.05 \
-  true \
-  50 \
-  1.0 \
-  0.9 \
-  true \
-  50 \
-  1.0 \
-  0.9 \
-  0
+fn main() -> qwen3_hip_runtime::Result<()> {
+    let engine = HipTtsEngine::load_with_max_frames("/path/to/model", 0, 240)?;
+    let mut stream = engine.start_stream("She said she would be here by noon.", GenerateOptions::default())?;
+
+    while let Some(chunk) = stream.next_audio_chunk(6)? {
+        println!("streamed {} new samples", chunk.samples.len());
+    }
+
+    Ok(())
+}
 ```
-
-Argument order:
-
-```text
-model_dir text max_frames reference_codes speaker language output_wav wav_gain repetition_penalty do_sample top_k top_p temperature subtalker_dosample subtalker_top_k subtalker_top_p subtalker_temperature seed
-```
-
-Use `none` or `-` for `reference_codes` when not checking exact fixture parity.
-Generation options are optional and default to the Qwen TTS generation defaults:
-`do_sample=true`, `top_k=50`, `top_p=1.0`, `temperature=0.9`,
-`repetition_penalty=1.05`, `subtalker_dosample=true`, `subtalker_top_k=50`,
-`subtalker_top_p=1.0`, and `subtalker_temperature=0.9`.
-
-Run a hot e2e benchmark for the public `HipTtsEngine` path and Qwen-default
-generation settings:
-
-```bash
-cargo run --release --bin hip-engine-bench -- \
-  /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-  "She said she would be here by noon." \
-  240 \
-  3 \
-  1
-```
-
-Run the lower-level deterministic greedy e2e benchmark:
-
-```bash
-cargo run --profile timing --bin hip-e2e-bench -- \
-  /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-  "She said she would be here by noon." \
-  39 \
-  3 \
-  1
-```
-
-Run the small standard-library web server:
-
-```bash
-cargo run --release --bin tts-server -- \
-  /path/to/Qwen3-TTS-12Hz-0.6B-CustomVoice \
-  127.0.0.1:8080 \
-  240
-```
-
-Open `http://127.0.0.1:8080/`. The page generates WAV audio and reports timing
-statistics such as generation time, decode time, audio duration, and RTF.
 
 ## Python Parity Fixtures
 
@@ -221,5 +164,6 @@ codec debugging. They are intentionally not part of the public API.
   `libhiprtc.so*`, and `librocblas.so*`.
 - Model weights are expected in Hugging Face snapshot layout, including
   `model.safetensors`, tokenizer files, and `speech_tokenizer/model.safetensors`.
-- Streaming audio is not exposed yet. The generation loop is frame-incremental,
-  but codec streaming still needs chunked decode/cache work.
+- `HipTtsEngine::start_stream(...)` exposes persistent frame-incremental generation.
+  Audio chunks use Qwen-style left-context window decode, currently with 25 context
+  frames. Lower-latency persistent codec-cache streaming is still future work.

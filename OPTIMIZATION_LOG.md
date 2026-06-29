@@ -347,3 +347,98 @@ Release benchmark, Qwen-default sampling, 0.6B, 34 frames:
 
 GEMM transconv is now the default. Set `QWEN3_HIP_DIRECT_TRANSCONV=1` to use the old
 direct kernel path for comparison.
+
+### CPU/GPU Time Split After GEMM Transconv
+
+Measured with `rocprofv3 --marker-trace --kernel-trace --memory-copy-trace --kernel-rename`
+using a delayed hot-window collection after model load. The benchmark used 0.6B,
+Qwen-default sampling, 1 warmup and 1 measured iteration.
+
+Benchmark wall time:
+
+```text
+generation_mean=1.388315s
+decode_mean=0.183308s
+e2e_mean=1.571623s
+```
+
+Profiler kernel time approximation:
+
+| Stage | Wall Time | GPU Kernel Time | Estimated Host Time |
+| --- | ---: | ---: | ---: |
+| Generation | `1.388s` | `0.965s` | `0.423s` |
+| Decode | `0.183s` | `0.144s` | `0.039s` |
+| E2E | `1.572s` | `1.109s` | `0.463s` |
+
+Approximate e2e split:
+
+```text
+GPU kernels: 70.6%
+CPU/host overhead: 29.4%
+```
+
+Largest host-side contributors from marker wall time minus renamed kernel time:
+
+| Stage | Approx Host Time |
+| --- | ---: |
+| `engine.prepare_text` | `0.241s` |
+| `engine.rollout.code_predictor` | `0.310s` |
+| `engine.rollout.talker_decode` | `0.095s` |
+| `engine.decode_codes` | `0.040s` |
+
+The CodePredictor and talker-decode host time is likely dominated by CPU-side sampling
+and GPU/CPU synchronization/copies. This reinforces GPU-side sampling as the next
+primary optimization target.
+
+### GPU Top-K Sampling Experiment
+
+Added a device-side sampler for the Qwen-default sampling shape:
+
+```text
+do_sample=true
+top_k in 1..=256
+top_p=1.0
+```
+
+Unsupported sampling settings still use the CPU sampler. Set `QWEN3_HIP_CPU_SAMPLING=1`
+to force the old CPU path for comparison.
+
+The first prototype used one GPU thread to do top-k selection and regressed badly:
+
+```text
+e2e_rtf=0.796936
+```
+
+Replacing that with a shared-memory bitonic sort over the vocab made the sampled path
+faster than the CPU sampler:
+
+| Path | Generation RTF | Decode RTF | E2E RTF |
+| --- | ---: | ---: | ---: |
+| CPU sampling fallback | `0.437339` | `0.066594` | `0.503933` |
+| GPU bitonic top-k sampling | `0.425911` | `0.066317` | `0.492228` |
+
+This is a modest win, roughly 2.3% e2e, because the sampler removes large logits
+D2H/H2D traffic but adds many sampling kernel launches and still copies selected
+semantic tokens to host for loop control/EOS. The remaining large host-side items are
+still CodePredictor/talker orchestration and text preparation.
+
+### Sampled CodePredictor Graph Replay
+
+Extended CodePredictor graph replay to the sampled path when sampling can stay on GPU.
+Group 0 remains eager; acoustic groups 1..14 are captured with projection, decode step,
+logits, GPU top-k sampling, token store, embedding lookup, and residual add. Random
+values are written into a stable device buffer before graph replay so graph kernel
+arguments remain reusable. The captured graph is keyed by `SamplingConfig`, so changing
+top-k/temperature recaptures instead of reusing stale scalar params.
+
+Measured with `hip-engine-bench`, 0.6B, Qwen-default sampling, 5 measured iterations and
+1 warmup iteration:
+
+| Path | Generation RTF | Decode RTF | E2E RTF |
+| --- | ---: | ---: | ---: |
+| GPU sampling, eager sampled CodePredictor | `0.425326` | `0.058447` | `0.483773` |
+| GPU sampling, sampled CodePredictor graph replay | `0.419242` | `0.058644` | `0.477886` |
+
+Discovery: sampled graph replay is correct and helps, but only modestly (~1.2% e2e).
+This matches earlier greedy graph replay results: launch overhead is not the dominant
+cost, but graph replay is still worth keeping on the default sampled path.

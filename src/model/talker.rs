@@ -13,7 +13,7 @@ use crate::kernels::{
     ARGMAX_F32_SOURCE, ELEMENTWISE_F32_SOURCE, EMBEDDING_F32_SOURCE, RMSNORM_F32_SOURCE,
     SUPPRESSION_F32_SOURCE,
 };
-use crate::model::sampling::{SamplingConfig, select_token};
+use crate::model::sampling::{SamplingConfig, next_f32, select_token};
 use crate::runtime::HipRuntime;
 use crate::weights::{TensorArchive, tensor_to_f32};
 
@@ -54,6 +54,7 @@ struct TalkerKernels {
     rmsnorm: HipFunction,
     argmax: HipFunction,
     suppress: HipFunction,
+    sample_topk: HipFunction,
     repetition_penalty: HipFunction,
     embedding_lookup: HipFunction,
     residual_add: HipFunction,
@@ -450,8 +451,6 @@ impl HipTalker {
             self.vocab_size,
             self.hidden_size,
         )?;
-        let needs_host_selection =
-            sampling.do_sample || previous_tokens.is_some_and(|tokens| !tokens.is_empty());
         if let Some(previous_tokens) = previous_tokens.filter(|tokens| !tokens.is_empty()) {
             launch_repetition_penalty(
                 &self.kernels.repetition_penalty,
@@ -468,7 +467,20 @@ impl HipTalker {
             self.vocab_size,
             self.codec_eos_token,
         )?;
-        if needs_host_selection {
+        if sampling.supports_device_sampling() {
+            let random_value = next_f32(rng_state);
+            launch_sample_topk(
+                &self.kernels.sample_topk,
+                &self.suppressed_logits,
+                &self.token,
+                self.vocab_size,
+                sampling.top_k,
+                sampling.temperature,
+                random_value,
+            )?;
+            return Ok(self.token.copy_to_host()?[0]);
+        }
+        if sampling.do_sample {
             let logits = self.suppressed_logits.copy_to_host()?;
             let token = select_token(&logits, sampling, rng_state)?;
             self.token.copy_from_host(&[token])?;
@@ -498,6 +510,7 @@ impl TalkerKernels {
             rmsnorm: rms_module.function("rmsnorm_f32")?,
             argmax: argmax_module.function("argmax_rows_f32")?,
             suppress: suppression_module.function("suppress_codec_logits_f32")?,
+            sample_topk: suppression_module.function("sample_topk_f32")?,
             repetition_penalty: suppression_module.function("apply_repetition_penalty_f32")?,
             embedding_lookup: embedding_module.function("embedding_lookup_f32")?,
             residual_add: elementwise_module.function("residual_add_f32")?,
@@ -597,6 +610,36 @@ fn launch_repetition_penalty(
         &mut penalty as *mut f32 as *mut c_void,
     ];
     function.launch((1, 1, 1), (1, 1, 1), 0, &mut params)
+}
+
+fn launch_sample_topk(
+    function: &HipFunction,
+    logits: &DeviceBuffer<f32>,
+    token: &DeviceBuffer<i32>,
+    vocab_size: usize,
+    top_k: usize,
+    temperature: f32,
+    random_value: f32,
+) -> Result<()> {
+    let mut logits_ptr = logits.as_ptr();
+    let mut token_ptr = token.as_mut_ptr();
+    let mut vocab_size_i32 = vocab_size as i32;
+    let sort_size = vocab_size.next_power_of_two();
+    let mut sort_size_i32 = sort_size as i32;
+    let mut top_k_i32 = top_k as i32;
+    let mut temperature = temperature;
+    let mut random_value = random_value;
+    let mut params = [
+        &mut logits_ptr as *mut *const c_void as *mut c_void,
+        &mut token_ptr as *mut *mut c_void as *mut c_void,
+        &mut vocab_size_i32 as *mut i32 as *mut c_void,
+        &mut sort_size_i32 as *mut i32 as *mut c_void,
+        &mut top_k_i32 as *mut i32 as *mut c_void,
+        &mut temperature as *mut f32 as *mut c_void,
+        &mut random_value as *mut f32 as *mut c_void,
+    ];
+    let shared = (sort_size * (std::mem::size_of::<f32>() + std::mem::size_of::<i32>())) as u32;
+    function.launch((1, 1, 1), (1024, 1, 1), shared, &mut params)
 }
 
 fn launch_embedding_lookup(

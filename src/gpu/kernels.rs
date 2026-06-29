@@ -262,6 +262,149 @@ extern "C" __global__ void suppress_codec_logits_f32(
     }
 }
 
+extern "C" __global__ void sample_topk_f32(
+    const float* logits,
+    int* token_out,
+    int vocab_size,
+    int sort_size,
+    int top_k,
+    float temperature,
+    float random_value
+) {
+    extern __shared__ unsigned char shared_bytes[];
+    float* values = reinterpret_cast<float*>(shared_bytes);
+    int* tokens = reinterpret_cast<int*>(values + sort_size);
+
+    for (int idx = threadIdx.x; idx < sort_size; idx += blockDim.x) {
+        if (idx < vocab_size && isfinite(logits[idx])) {
+            values[idx] = logits[idx];
+            tokens[idx] = idx;
+        } else {
+            values[idx] = -3.4028234663852886e38f;
+            tokens[idx] = idx;
+        }
+    }
+    __syncthreads();
+
+    for (int size = 2; size <= sort_size; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int idx = threadIdx.x; idx < sort_size; idx += blockDim.x) {
+                int partner = idx ^ stride;
+                if (partner > idx) {
+                    bool ascending = (idx & size) != 0;
+                    float a = values[idx];
+                    float b = values[partner];
+                    bool swap = ascending ? (a > b) : (a < b);
+                    if (swap) {
+                        values[idx] = b;
+                        values[partner] = a;
+                        int token = tokens[idx];
+                        tokens[idx] = tokens[partner];
+                        tokens[partner] = token;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        int kept = top_k < vocab_size ? top_k : vocab_size;
+        float max_logit = values[0];
+        float sum = 0.0f;
+        for (int idx = 0; idx < kept; ++idx) {
+            float prob = expf((values[idx] - max_logit) / temperature);
+            values[idx] = prob;
+            sum += prob;
+        }
+        if (!isfinite(sum) || sum <= 0.0f) {
+            token_out[0] = tokens[0];
+            return;
+        }
+        float target = random_value * sum;
+        for (int idx = 0; idx < kept; ++idx) {
+            if (target <= values[idx]) {
+                token_out[0] = tokens[idx];
+                return;
+            }
+            target -= values[idx];
+        }
+        token_out[0] = tokens[kept - 1];
+    }
+}
+
+extern "C" __global__ void sample_topk_random_buffer_f32(
+    const float* logits,
+    int* token_out,
+    const float* random_values,
+    int random_offset,
+    int vocab_size,
+    int sort_size,
+    int top_k,
+    float temperature
+) {
+    extern __shared__ unsigned char shared_bytes[];
+    float* values = reinterpret_cast<float*>(shared_bytes);
+    int* tokens = reinterpret_cast<int*>(values + sort_size);
+
+    for (int idx = threadIdx.x; idx < sort_size; idx += blockDim.x) {
+        if (idx < vocab_size && isfinite(logits[idx])) {
+            values[idx] = logits[idx];
+            tokens[idx] = idx;
+        } else {
+            values[idx] = -3.4028234663852886e38f;
+            tokens[idx] = idx;
+        }
+    }
+    __syncthreads();
+
+    for (int size = 2; size <= sort_size; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int idx = threadIdx.x; idx < sort_size; idx += blockDim.x) {
+                int partner = idx ^ stride;
+                if (partner > idx) {
+                    bool ascending = (idx & size) != 0;
+                    float a = values[idx];
+                    float b = values[partner];
+                    bool swap = ascending ? (a > b) : (a < b);
+                    if (swap) {
+                        values[idx] = b;
+                        values[partner] = a;
+                        int token = tokens[idx];
+                        tokens[idx] = tokens[partner];
+                        tokens[partner] = token;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        int kept = top_k < vocab_size ? top_k : vocab_size;
+        float max_logit = values[0];
+        float sum = 0.0f;
+        for (int idx = 0; idx < kept; ++idx) {
+            float prob = expf((values[idx] - max_logit) / temperature);
+            values[idx] = prob;
+            sum += prob;
+        }
+        if (!isfinite(sum) || sum <= 0.0f) {
+            token_out[0] = tokens[0];
+            return;
+        }
+        float target = random_values[random_offset] * sum;
+        for (int idx = 0; idx < kept; ++idx) {
+            if (target <= values[idx]) {
+                token_out[0] = tokens[idx];
+                return;
+            }
+            target -= values[idx];
+        }
+        token_out[0] = tokens[kept - 1];
+    }
+}
+
 extern "C" __global__ void apply_repetition_penalty_f32(
     float* logits,
     const int* tokens,

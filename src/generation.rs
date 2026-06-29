@@ -15,6 +15,7 @@ pub use crate::model::text::{Language, Speaker};
 pub const SAMPLE_RATE: u32 = 24_000;
 pub const DEFAULT_MAX_CACHE_STEPS: usize = 512;
 pub const DEFAULT_PREFILL_HEADROOM: usize = 256;
+pub const DEFAULT_STREAM_LEFT_CONTEXT_FRAMES: usize = 25;
 
 #[derive(Clone, Debug)]
 pub struct EngineOptions {
@@ -90,6 +91,42 @@ pub struct HipTtsEngine {
     max_cache_steps: usize,
     code_groups: usize,
     codec_eos_token: i32,
+}
+
+pub struct HipTtsStream<'a> {
+    engine: &'a HipTtsEngine,
+    text: String,
+    prefill_steps: usize,
+    max_frames: usize,
+    talker_sampling: SamplingConfig,
+    subtalker_sampling: SamplingConfig,
+    repetition_penalty: f32,
+    rng_state: u64,
+    trailing: Vec<DeviceBuffer<f32>>,
+    cp_prefix: DeviceBuffer<f32>,
+    acoustic_sum: DeviceBuffer<f32>,
+    semantic: i32,
+    semantic_history: Vec<i32>,
+    codes: Vec<i32>,
+    frame: usize,
+    ended_by_eos: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct GeneratedCodesChunk {
+    pub codes: Vec<i32>,
+    pub frames: usize,
+    pub total_frames: usize,
+    pub ended_by_eos: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct GeneratedAudioChunk {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub frames: usize,
+    pub total_frames: usize,
+    pub ended_by_eos: bool,
 }
 
 impl HipTtsEngine {
@@ -200,6 +237,80 @@ impl HipTtsEngine {
         }
         let codes = self.rollout(&inputs, &options)?;
         Ok(codes)
+    }
+
+    pub fn start_stream(&self, text: &str, options: GenerateOptions) -> Result<HipTtsStream<'_>> {
+        let _range = profile::range("engine.start_stream");
+        if options.max_frames == 0 {
+            return Err(Error::InvalidInput(
+                "max_frames must be non-zero".to_string(),
+            ));
+        }
+        if options.repetition_penalty <= 0.0 {
+            return Err(Error::InvalidInput(
+                "repetition_penalty must be positive".to_string(),
+            ));
+        }
+        options.talker_sampling().validate("talker")?;
+        options.subtalker_sampling().validate("subtalker")?;
+        let inputs = {
+            let _range = profile::range("engine.prepare_text");
+            self.prep
+                .prepare_custom_voice(text, options.speaker, options.language)?
+        };
+        if inputs.prefill_steps + options.max_frames > self.max_cache_steps {
+            return Err(Error::InvalidInput(format!(
+                "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
+                inputs.prefill_steps + options.max_frames,
+                self.max_cache_steps
+            )));
+        }
+
+        let talker_sampling = options.talker_sampling();
+        let subtalker_sampling = options.subtalker_sampling();
+        let mut rng_state = options.seed ^ 0x9e37_79b9_7f4a_7c15;
+        let hidden = self.talker.hidden_size();
+        let prefill = self.runtime.buffer_from_slice(&inputs.prefill)?;
+        let trailing = {
+            let _range = profile::range("engine.rollout.upload_trailing");
+            self.upload_trailing(
+                &inputs.trailing_text,
+                &inputs.tts_pad_embed,
+                options.max_frames.saturating_sub(1),
+                hidden,
+            )?
+        };
+        let semantic = {
+            let _range = profile::range("engine.rollout.talker_prefill");
+            if talker_sampling.do_sample {
+                self.talker.prefill_token_with_sampling(
+                    &prefill,
+                    inputs.prefill_steps,
+                    talker_sampling,
+                    &mut rng_state,
+                )?
+            } else {
+                self.talker.prefill_token(&prefill, inputs.prefill_steps)?
+            }
+        };
+        Ok(HipTtsStream {
+            engine: self,
+            text: text.to_string(),
+            prefill_steps: inputs.prefill_steps,
+            max_frames: options.max_frames,
+            talker_sampling,
+            subtalker_sampling,
+            repetition_penalty: options.repetition_penalty,
+            rng_state,
+            trailing,
+            cp_prefix: self.runtime.empty_buffer::<f32>(2 * hidden)?,
+            acoustic_sum: self.runtime.empty_buffer::<f32>(hidden)?,
+            semantic,
+            semantic_history: Vec::with_capacity(options.max_frames),
+            codes: Vec::with_capacity(options.max_frames * self.code_groups),
+            frame: 0,
+            ended_by_eos: false,
+        })
     }
 
     pub fn decode_codes(&self, codes: &[i32]) -> Result<Vec<f32>> {
@@ -354,6 +465,135 @@ impl HipTtsEngine {
             }
         }
         Ok(buffers)
+    }
+}
+
+impl HipTtsStream<'_> {
+    pub fn next_codes_chunk(
+        &mut self,
+        max_chunk_frames: usize,
+    ) -> Result<Option<GeneratedCodesChunk>> {
+        let _range = profile::range("engine.stream.next_codes_chunk");
+        if max_chunk_frames == 0 {
+            return Err(Error::InvalidInput(
+                "max_chunk_frames must be non-zero".to_string(),
+            ));
+        }
+        if self.ended_by_eos || self.frame >= self.max_frames {
+            return Ok(None);
+        }
+
+        let start = self.codes.len();
+        let mut produced = 0usize;
+        while produced < max_chunk_frames && self.frame < self.max_frames {
+            if self.semantic == self.engine.codec_eos_token {
+                self.ended_by_eos = true;
+                break;
+            }
+            {
+                let _range = profile::range("engine.rollout.prepare_code_predictor_prefix");
+                self.engine
+                    .talker
+                    .prepare_code_predictor_prefix(&self.cp_prefix)?;
+            }
+            let acoustic = {
+                let _range = profile::range("engine.rollout.code_predictor");
+                self.engine.predictor.generate_to_buffer_with_options(
+                    &self.cp_prefix,
+                    &self.acoustic_sum,
+                    self.subtalker_sampling,
+                    &mut self.rng_state,
+                )?
+            };
+            self.codes.push(self.semantic);
+            self.codes.extend(acoustic);
+            self.semantic_history.push(self.semantic);
+            produced += 1;
+
+            let current_frame = self.frame;
+            if current_frame + 1 < self.max_frames {
+                {
+                    let _range = profile::range("engine.rollout.build_step_input");
+                    self.engine
+                        .talker
+                        .build_step_input(&self.acoustic_sum, &self.trailing[current_frame])?;
+                }
+                self.semantic = {
+                    let _range = profile::range("engine.rollout.talker_decode");
+                    if self.repetition_penalty != 1.0 || self.talker_sampling.do_sample {
+                        let previous = self
+                            .engine
+                            .runtime
+                            .buffer_from_slice(&self.semantic_history)?;
+                        self.engine.talker.decode_prepared_token_with_options(
+                            self.prefill_steps + current_frame,
+                            &previous,
+                            self.repetition_penalty,
+                            self.talker_sampling,
+                            &mut self.rng_state,
+                        )?
+                    } else {
+                        self.engine
+                            .talker
+                            .decode_prepared_token(self.prefill_steps + current_frame)?
+                    }
+                };
+            }
+            self.frame += 1;
+        }
+        if self.frame < self.max_frames && self.semantic == self.engine.codec_eos_token {
+            self.ended_by_eos = true;
+        }
+        self.engine.runtime.synchronize()?;
+
+        if self.codes.len() == start {
+            return Ok(None);
+        }
+        let codes = self.codes[start..].to_vec();
+        Ok(Some(GeneratedCodesChunk {
+            frames: codes.len() / self.engine.code_groups,
+            codes,
+            total_frames: self.frame,
+            ended_by_eos: self.ended_by_eos,
+        }))
+    }
+
+    pub fn next_audio_chunk(
+        &mut self,
+        max_chunk_frames: usize,
+    ) -> Result<Option<GeneratedAudioChunk>> {
+        let Some(codes) = self.next_codes_chunk(max_chunk_frames)? else {
+            return Ok(None);
+        };
+        let start_frame = codes.total_frames - codes.frames;
+        let context_frames = DEFAULT_STREAM_LEFT_CONTEXT_FRAMES.min(start_frame);
+        let decode_start_frame = start_frame - context_frames;
+        let decode_start = decode_start_frame * self.engine.code_groups;
+        let decode_end = codes.total_frames * self.engine.code_groups;
+        let decoded = self
+            .engine
+            .decode_codes(&self.codes[decode_start..decode_end])?;
+        let context_samples = context_frames * self.engine.codec.samples_per_code_frame();
+        let samples = decoded[context_samples.min(decoded.len())..].to_vec();
+        Ok(Some(GeneratedAudioChunk {
+            samples,
+            sample_rate: SAMPLE_RATE,
+            frames: codes.frames,
+            total_frames: codes.total_frames,
+            ended_by_eos: codes.ended_by_eos,
+        }))
+    }
+
+    pub fn finish_codes(self) -> GeneratedCodes {
+        GeneratedCodes {
+            frames: self.codes.len() / self.engine.code_groups,
+            codes: self.codes,
+            ended_by_eos: self.ended_by_eos,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
     }
 }
 

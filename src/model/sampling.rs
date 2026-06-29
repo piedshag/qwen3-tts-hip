@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SamplingConfig {
     pub do_sample: bool,
     pub top_k: usize,
@@ -23,6 +23,17 @@ impl SamplingConfig {
             )));
         }
         Ok(())
+    }
+
+    pub(crate) fn supports_device_sampling(self) -> bool {
+        self.do_sample
+            && self.top_k > 0
+            && self.top_k <= 256
+            && self.top_p >= 0.999_999
+            && !matches!(
+                std::env::var("QWEN3_HIP_CPU_SAMPLING").as_deref(),
+                Ok("1" | "true" | "yes" | "on")
+            )
     }
 }
 
@@ -106,7 +117,7 @@ fn sample(logits: &[f32], config: SamplingConfig, state: &mut u64) -> Result<i32
         .unwrap_or(0))
 }
 
-fn next_f32(state: &mut u64) -> f32 {
+pub(crate) fn next_f32(state: &mut u64) -> f32 {
     *state = state
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);

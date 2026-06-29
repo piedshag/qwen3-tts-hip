@@ -76,8 +76,8 @@ pub use blas::RocblasHandle;
 pub use buffer::DeviceBuffer;
 pub use error::{Error, Result};
 pub use generation::{
-    EngineOptions, GenerateOptions, GeneratedCodes, GeneratedSpeech, HipTtsEngine, Language,
-    Speaker,
+    EngineOptions, GenerateOptions, GeneratedAudioChunk, GeneratedCodes, GeneratedCodesChunk,
+    GeneratedSpeech, HipTtsEngine, HipTtsStream, Language, Speaker,
 };
 pub use graph::{HipGraph, HipGraphExec, HipStream};
 pub use kernel::{HipFunction, HipModule};

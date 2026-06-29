@@ -201,6 +201,16 @@ pub struct HipCodecDecoderOutputs {
 }
 
 impl HipCodecInitial {
+    pub fn samples_per_code_frame(&self) -> usize {
+        UPSAMPLE_RATIO
+            * UPSAMPLE_RATIO
+            * self
+                .decoder_blocks
+                .iter()
+                .map(|block| block.stride)
+                .product::<usize>()
+    }
+
     pub fn load(runtime: &HipRuntime, model_dir: &Path) -> Result<Self> {
         let archive = TensorArchive::open(&model_dir.join("speech_tokenizer/model.safetensors"))?;
         let first_codebook = load_normalized_codebook(
