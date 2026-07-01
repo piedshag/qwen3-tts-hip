@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_MODEL = "/home/flynn/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-0.6B-CustomVoice/snapshots/85e237c12c027371202489a0ec509ded67b5e4b5"
+DEFAULT_MODEL = "/home/flynn/.cache/huggingface/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe"
 DEFAULT_REPO = "/home/flynn/Qwen3-TTS"
 DEFAULT_TEXT = (
     "The speaker describes a calm morning in the city, where people walk to work, "
@@ -134,7 +134,7 @@ def main() -> None:
     parser.add_argument("--subtalker-top-p", type=float, default=1.0)
     parser.add_argument("--subtalker-temperature", type=float, default=0.9)
     parser.add_argument(
-        "--non-streaming-mode", action=argparse.BooleanOptionalAction, default=False
+        "--non-streaming-mode", action=argparse.BooleanOptionalAction, default=True
     )
     parser.add_argument(
         "--out",
