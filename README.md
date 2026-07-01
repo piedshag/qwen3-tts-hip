@@ -146,6 +146,15 @@ cargo check
 ./scripts/qwen3-hip-parity.sh quick
 ```
 
+Benchmark the Python Qwen3-TTS reference path with a generic prompt:
+
+```bash
+python-reference/.venv/bin/python scripts/qwen3-python-rtf-bench.py
+```
+
+The script runs one warmup by default so measured RTF excludes first-use MIOpen and
+kernel setup costs.
+
 The repository also contains lower-level smoke, parity, and benchmark binaries for
 HIP runtime primitives, decoder stacks, graph capture, CodePredictor, talker, and
 codec debugging. They are intentionally not part of the public API.
