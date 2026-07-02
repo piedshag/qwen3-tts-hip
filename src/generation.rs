@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::audio::codec_hip::HipCodecInitial;
 use crate::error::{Error, Result};
@@ -79,6 +80,35 @@ pub struct GeneratedSpeech {
     pub ended_by_eos: bool,
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct GenerationProfile {
+    pub prepare_text_seconds: f64,
+    pub upload_seconds: f64,
+    pub prefill_seconds: f64,
+    pub prepare_prefix_seconds: f64,
+    pub code_predictor_seconds: f64,
+    pub build_step_input_seconds: f64,
+    pub talker_decode_seconds: f64,
+}
+
+impl GenerationProfile {
+    pub fn total_seconds(&self) -> f64 {
+        self.prepare_text_seconds
+            + self.upload_seconds
+            + self.prefill_seconds
+            + self.prepare_prefix_seconds
+            + self.code_predictor_seconds
+            + self.build_step_input_seconds
+            + self.talker_decode_seconds
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProfiledGeneratedCodes {
+    pub codes: GeneratedCodes,
+    pub profile: GenerationProfile,
 }
 
 pub struct HipTtsEngine {
@@ -237,6 +267,46 @@ impl HipTtsEngine {
         }
         let codes = self.rollout(&inputs, &options)?;
         Ok(codes)
+    }
+
+    pub fn generate_codes_profiled(
+        &self,
+        text: &str,
+        options: GenerateOptions,
+    ) -> Result<ProfiledGeneratedCodes> {
+        let _range = profile::range("engine.generate_codes_profiled");
+        if options.max_frames == 0 {
+            return Err(Error::InvalidInput(
+                "max_frames must be non-zero".to_string(),
+            ));
+        }
+        if options.repetition_penalty <= 0.0 {
+            return Err(Error::InvalidInput(
+                "repetition_penalty must be positive".to_string(),
+            ));
+        }
+        options.talker_sampling().validate("talker")?;
+        options.subtalker_sampling().validate("subtalker")?;
+
+        let mut timings = GenerationProfile::default();
+        let start = Instant::now();
+        let inputs = self
+            .prep
+            .prepare_custom_voice(text, options.speaker, options.language)?;
+        timings.prepare_text_seconds = start.elapsed().as_secs_f64();
+        if inputs.prefill_steps + options.max_frames > self.max_cache_steps {
+            return Err(Error::InvalidInput(format!(
+                "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
+                inputs.prefill_steps + options.max_frames,
+                self.max_cache_steps
+            )));
+        }
+
+        let codes = self.rollout_profiled(&inputs, &options, &mut timings)?;
+        Ok(ProfiledGeneratedCodes {
+            codes,
+            profile: timings,
+        })
     }
 
     pub fn start_stream(&self, text: &str, options: GenerateOptions) -> Result<HipTtsStream<'_>> {
@@ -437,6 +507,107 @@ impl HipTtsEngine {
             }
         }
         self.runtime.synchronize()?;
+        let frames = codes.len() / self.code_groups;
+        Ok(GeneratedCodes {
+            codes,
+            frames,
+            ended_by_eos,
+        })
+    }
+
+    fn rollout_profiled(
+        &self,
+        inputs: &CustomVoiceInputs,
+        options: &GenerateOptions,
+        timings: &mut GenerationProfile,
+    ) -> Result<GeneratedCodes> {
+        let max_frames = options.max_frames;
+        let talker_sampling = options.talker_sampling();
+        let subtalker_sampling = options.subtalker_sampling();
+        let repetition_penalty = options.repetition_penalty;
+        let mut rng_state = options.seed ^ 0x9e37_79b9_7f4a_7c15;
+        let hidden = self.talker.hidden_size();
+
+        let start = Instant::now();
+        let prefill = self.runtime.buffer_from_slice(&inputs.prefill)?;
+        let trailing = self.upload_trailing(
+            &inputs.trailing_text,
+            &inputs.tts_pad_embed,
+            max_frames.saturating_sub(1),
+            hidden,
+        )?;
+        let cp_prefix = self.runtime.empty_buffer::<f32>(2 * hidden)?;
+        let acoustic_sum = self.runtime.empty_buffer::<f32>(hidden)?;
+        self.runtime.synchronize()?;
+        timings.upload_seconds += start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let mut semantic = if talker_sampling.do_sample {
+            self.talker.prefill_token_with_sampling(
+                &prefill,
+                inputs.prefill_steps,
+                talker_sampling,
+                &mut rng_state,
+            )?
+        } else {
+            self.talker.prefill_token(&prefill, inputs.prefill_steps)?
+        };
+        self.runtime.synchronize()?;
+        timings.prefill_seconds += start.elapsed().as_secs_f64();
+
+        let mut codes = Vec::with_capacity(max_frames * self.code_groups);
+        let mut semantic_history = Vec::with_capacity(max_frames);
+        let mut ended_by_eos = false;
+        for frame in 0..max_frames {
+            if semantic == self.codec_eos_token {
+                ended_by_eos = true;
+                break;
+            }
+
+            let start = Instant::now();
+            self.talker.prepare_code_predictor_prefix(&cp_prefix)?;
+            self.runtime.synchronize()?;
+            timings.prepare_prefix_seconds += start.elapsed().as_secs_f64();
+
+            let start = Instant::now();
+            let acoustic = self.predictor.generate_to_buffer_with_options(
+                &cp_prefix,
+                &acoustic_sum,
+                subtalker_sampling,
+                &mut rng_state,
+            )?;
+            self.runtime.synchronize()?;
+            timings.code_predictor_seconds += start.elapsed().as_secs_f64();
+
+            codes.push(semantic);
+            codes.extend(acoustic);
+            semantic_history.push(semantic);
+            if frame + 1 < max_frames {
+                let start = Instant::now();
+                self.talker
+                    .build_step_input(&acoustic_sum, &trailing[frame])?;
+                self.runtime.synchronize()?;
+                timings.build_step_input_seconds += start.elapsed().as_secs_f64();
+
+                let start = Instant::now();
+                semantic = if repetition_penalty != 1.0 || talker_sampling.do_sample {
+                    let previous = self.runtime.buffer_from_slice(&semantic_history)?;
+                    self.talker.decode_prepared_token_with_options(
+                        inputs.prefill_steps + frame,
+                        &previous,
+                        repetition_penalty,
+                        talker_sampling,
+                        &mut rng_state,
+                    )?
+                } else {
+                    self.talker
+                        .decode_prepared_token(inputs.prefill_steps + frame)?
+                };
+                self.runtime.synchronize()?;
+                timings.talker_decode_seconds += start.elapsed().as_secs_f64();
+            }
+        }
+
         let frames = codes.len() / self.code_groups;
         Ok(GeneratedCodes {
             codes,

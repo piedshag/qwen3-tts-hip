@@ -77,7 +77,8 @@ pub use buffer::DeviceBuffer;
 pub use error::{Error, Result};
 pub use generation::{
     EngineOptions, GenerateOptions, GeneratedAudioChunk, GeneratedCodes, GeneratedCodesChunk,
-    GeneratedSpeech, HipTtsEngine, HipTtsStream, Language, Speaker,
+    GeneratedSpeech, GenerationProfile, HipTtsEngine, HipTtsStream, Language,
+    ProfiledGeneratedCodes, Speaker,
 };
 pub use graph::{HipGraph, HipGraphExec, HipStream};
 pub use kernel::{HipFunction, HipModule};
