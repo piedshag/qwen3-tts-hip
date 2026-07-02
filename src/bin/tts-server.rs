@@ -4,7 +4,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use qwen3_hip_runtime::generation::SAMPLE_RATE;
+use qwen3_hip_runtime::generation::{DEFAULT_TEXT_LOOKAHEAD_TOKENS, SAMPLE_RATE};
 use qwen3_hip_runtime::{
     Error, GenerateOptions, GeneratedSpeech, HipTtsEngine, Language, Result, Speaker,
 };
@@ -194,6 +194,10 @@ fn handle_generate(state: &ServerState, stream: &mut TcpStream, request: &Reques
             format_seconds(options.subtalker_temperature as f64),
         ),
         ("X-TTS-Seed", options.seed.to_string()),
+        (
+            "X-TTS-Text-Lookahead-Tokens",
+            options.text_lookahead_tokens.to_string(),
+        ),
     ];
     send_response(stream, 200, "OK", &headers, &wav)
 }
@@ -232,6 +236,10 @@ fn handle_stream(state: &ServerState, stream: &mut TcpStream, request: &Request)
             (
                 "X-TTS-Chunk-Frames",
                 request.stream_chunk_frames.to_string(),
+            ),
+            (
+                "X-TTS-Text-Lookahead-Tokens",
+                request.options.text_lookahead_tokens.to_string(),
             ),
         ],
     )?;
@@ -349,6 +357,16 @@ fn parse_generation_request(state: &ServerState, request: &Request) -> Result<Ge
         .map(|value| parse_u64(value, "seed"))
         .transpose()?
         .unwrap_or(0);
+    let text_lookahead_tokens = form
+        .get("text_lookahead_tokens")
+        .map(|value| parse_usize(value, "text_lookahead_tokens"))
+        .transpose()?
+        .unwrap_or(DEFAULT_TEXT_LOOKAHEAD_TOKENS);
+    if text_lookahead_tokens == 0 {
+        return Err(Error::InvalidInput(
+            "text_lookahead_tokens must be non-zero".to_string(),
+        ));
+    }
     let stream_chunk_frames = form
         .get("stream_chunk_frames")
         .map(|value| parse_usize(value, "stream_chunk_frames"))
@@ -377,6 +395,7 @@ fn parse_generation_request(state: &ServerState, request: &Request) -> Result<Ge
             subtalker_top_p,
             subtalker_temperature,
             seed,
+            text_lookahead_tokens,
         },
         wav_gain,
         stream_chunk_frames,
@@ -632,6 +651,9 @@ fn index_html(state: &ServerState) -> String {
       <label>Seed
         <input name="seed" type="number" min="0" value="0">
       </label>
+      <label>Text lookahead
+        <input name="text_lookahead_tokens" type="number" min="1" value="{default_text_lookahead_tokens}">
+      </label>
       <label>Stream chunk frames
         <input name="stream_chunk_frames" type="number" min="1" value="{default_stream_chunk_frames}">
       </label>
@@ -687,6 +709,7 @@ const statHeaders = [
   ['subtalker_top_p', 'x-tts-subtalker-top-p'],
   ['subtalker_temperature', 'x-tts-subtalker-temperature'],
   ['seed', 'x-tts-seed'],
+  ['text_lookahead_tokens', 'x-tts-text-lookahead-tokens'],
 ];
 
 form.addEventListener('submit', async (event) => {{
@@ -793,6 +816,7 @@ streamButton.addEventListener('click', async () => {{
         max_cache_frames = state.max_cache_frames,
         sample_rate = SAMPLE_RATE,
         default_stream_chunk_frames = DEFAULT_STREAM_CHUNK_FRAMES,
+        default_text_lookahead_tokens = DEFAULT_TEXT_LOOKAHEAD_TOKENS,
     )
 }
 

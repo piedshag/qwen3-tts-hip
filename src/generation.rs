@@ -17,6 +17,7 @@ pub const SAMPLE_RATE: u32 = 24_000;
 pub const DEFAULT_MAX_CACHE_STEPS: usize = 512;
 pub const DEFAULT_PREFILL_HEADROOM: usize = 256;
 pub const DEFAULT_STREAM_LEFT_CONTEXT_FRAMES: usize = 25;
+pub const DEFAULT_TEXT_LOOKAHEAD_TOKENS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct EngineOptions {
@@ -49,6 +50,7 @@ pub struct GenerateOptions {
     pub subtalker_top_p: f32,
     pub subtalker_temperature: f32,
     pub seed: u64,
+    pub text_lookahead_tokens: usize,
 }
 
 impl Default for GenerateOptions {
@@ -68,6 +70,7 @@ impl Default for GenerateOptions {
             subtalker_top_p: 1.0,
             subtalker_temperature: 0.9,
             seed: 0,
+            text_lookahead_tokens: DEFAULT_TEXT_LOOKAHEAD_TOKENS,
         }
     }
 }
@@ -251,12 +254,21 @@ impl HipTtsEngine {
                 "repetition_penalty must be positive".to_string(),
             ));
         }
+        if options.text_lookahead_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "text_lookahead_tokens must be non-zero".to_string(),
+            ));
+        }
         options.talker_sampling().validate("talker")?;
         options.subtalker_sampling().validate("subtalker")?;
         let inputs = {
             let _range = profile::range("engine.prepare_text");
-            self.prep
-                .prepare_custom_voice(text, options.speaker, options.language)?
+            self.prep.prepare_custom_voice_with_lookahead(
+                text,
+                options.speaker,
+                options.language,
+                options.text_lookahead_tokens,
+            )?
         };
         if inputs.prefill_steps + options.max_frames > self.max_cache_steps {
             return Err(Error::InvalidInput(format!(
@@ -285,14 +297,22 @@ impl HipTtsEngine {
                 "repetition_penalty must be positive".to_string(),
             ));
         }
+        if options.text_lookahead_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "text_lookahead_tokens must be non-zero".to_string(),
+            ));
+        }
         options.talker_sampling().validate("talker")?;
         options.subtalker_sampling().validate("subtalker")?;
 
         let mut timings = GenerationProfile::default();
         let start = Instant::now();
-        let inputs = self
-            .prep
-            .prepare_custom_voice(text, options.speaker, options.language)?;
+        let inputs = self.prep.prepare_custom_voice_with_lookahead(
+            text,
+            options.speaker,
+            options.language,
+            options.text_lookahead_tokens,
+        )?;
         timings.prepare_text_seconds = start.elapsed().as_secs_f64();
         if inputs.prefill_steps + options.max_frames > self.max_cache_steps {
             return Err(Error::InvalidInput(format!(
@@ -321,12 +341,21 @@ impl HipTtsEngine {
                 "repetition_penalty must be positive".to_string(),
             ));
         }
+        if options.text_lookahead_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "text_lookahead_tokens must be non-zero".to_string(),
+            ));
+        }
         options.talker_sampling().validate("talker")?;
         options.subtalker_sampling().validate("subtalker")?;
         let inputs = {
             let _range = profile::range("engine.prepare_text");
-            self.prep
-                .prepare_custom_voice(text, options.speaker, options.language)?
+            self.prep.prepare_custom_voice_with_lookahead(
+                text,
+                options.speaker,
+                options.language,
+                options.text_lookahead_tokens,
+            )?
         };
         if inputs.prefill_steps + options.max_frames > self.max_cache_steps {
             return Err(Error::InvalidInput(format!(

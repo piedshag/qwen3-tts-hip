@@ -1,7 +1,8 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::buffer::DeviceBuffer;
 use crate::error::{Error, Result};
@@ -13,6 +14,27 @@ pub struct RocblasHandle {
     handle: NonNull<c_void>,
     api: Arc<RocblasApi>,
     stream: Cell<*mut c_void>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct GemmShape {
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GemmShapeStats {
+    calls: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SgemmProfileEntry {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    pub calls: usize,
+    pub flops: u128,
 }
 
 impl RocblasHandle {
@@ -105,6 +127,8 @@ impl RocblasHandle {
             )));
         }
 
+        record_sgemm_shape(m, n, k);
+
         let alpha = 1.0f32;
         let beta = 0.0f32;
         let status = unsafe {
@@ -127,6 +151,63 @@ impl RocblasHandle {
         };
         RocblasApi::check("rocblas_sgemm", status)
     }
+}
+
+pub fn reset_sgemm_profile() {
+    if let Some(profile) = SGEMM_PROFILE.get() {
+        profile
+            .lock()
+            .expect("sgemm profile mutex poisoned")
+            .clear();
+    }
+}
+
+pub fn sgemm_profile_entries() -> Vec<SgemmProfileEntry> {
+    let Some(profile) = SGEMM_PROFILE.get() else {
+        return Vec::new();
+    };
+    let mut entries: Vec<_> = profile
+        .lock()
+        .expect("sgemm profile mutex poisoned")
+        .iter()
+        .map(|(shape, stats)| SgemmProfileEntry {
+            m: shape.m,
+            n: shape.n,
+            k: shape.k,
+            calls: stats.calls,
+            flops: 2u128
+                * shape.m as u128
+                * shape.n as u128
+                * shape.k as u128
+                * stats.calls as u128,
+        })
+        .collect();
+    entries.sort_by(|a, b| b.flops.cmp(&a.flops));
+    entries
+}
+
+static SGEMM_PROFILE: OnceLock<Mutex<HashMap<GemmShape, GemmShapeStats>>> = OnceLock::new();
+
+fn record_sgemm_shape(m: usize, n: usize, k: usize) {
+    if !sgemm_profile_enabled() {
+        return;
+    }
+    let profile = SGEMM_PROFILE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut profile = profile.lock().expect("sgemm profile mutex poisoned");
+    let stats = profile
+        .entry(GemmShape { m, n, k })
+        .or_insert_with(GemmShapeStats::default);
+    stats.calls += 1;
+}
+
+fn sgemm_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("QWEN3_HIP_GEMM_PROFILE").as_deref(),
+            Ok("1" | "true" | "yes" | "on")
+        )
+    })
 }
 
 impl Drop for RocblasHandle {

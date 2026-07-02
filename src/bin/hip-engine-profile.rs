@@ -49,6 +49,7 @@ fn main() -> Result<()> {
         let _samples = engine.decode_codes(&codes.codes)?;
     }
 
+    qwen3_hip_runtime::blas::reset_sgemm_profile();
     let profiled = engine.generate_codes_profiled(&text, options)?;
     let decode_start = Instant::now();
     let samples = engine.decode_codes(&profiled.codes.codes)?;
@@ -96,6 +97,23 @@ fn main() -> Result<()> {
         pct(profiled.profile.code_predictor_seconds, total),
         pct(decode_seconds, total),
     );
+    let gemms = qwen3_hip_runtime::blas::sgemm_profile_entries();
+    if !gemms.is_empty() {
+        println!(
+            "HIP engine profile GEMM shapes: top={}",
+            gemms.len().min(16)
+        );
+        for entry in gemms.iter().take(16) {
+            println!(
+                "  m={}, n={}, k={}, calls={}, gflop={:.3}",
+                entry.m,
+                entry.n,
+                entry.k,
+                entry.calls,
+                entry.flops as f64 / 1.0e9,
+            );
+        }
+    }
     Ok(())
 }
 

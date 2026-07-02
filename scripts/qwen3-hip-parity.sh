@@ -66,7 +66,8 @@ cargo run --profile "$PROFILE" --bin hip-custom-voice-generate -- \
   50 \
   1.0 \
   1.0 \
-  0
+  0 \
+  1
 
 if [[ "$MODE" == "full" ]]; then
   cargo run --profile "$PROFILE" --bin hip-custom-voice-generate -- \
@@ -87,7 +88,8 @@ if [[ "$MODE" == "full" ]]; then
     50 \
     1.0 \
     1.0 \
-    0
+    0 \
+    1
 
   cargo run --profile "$PROFILE" --bin hip-codec-initial-parity -- \
     "$MODEL_DIR" \

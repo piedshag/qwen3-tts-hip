@@ -333,6 +333,21 @@ impl CustomVoiceTextPrep {
         speaker: Speaker,
         language: Language,
     ) -> Result<CustomVoiceInputs> {
+        self.prepare_custom_voice_with_lookahead(text, speaker, language, 1)
+    }
+
+    pub fn prepare_custom_voice_with_lookahead(
+        &self,
+        text: &str,
+        speaker: Speaker,
+        language: Language,
+        text_lookahead_tokens: usize,
+    ) -> Result<CustomVoiceInputs> {
+        if text_lookahead_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "text_lookahead_tokens must be non-zero".to_string(),
+            ));
+        }
         let assistant_text =
             format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n");
         let input_ids = self.tokenizer.encode(&assistant_text)?;
@@ -343,8 +358,14 @@ impl CustomVoiceTextPrep {
             )));
         }
         let content_ids = input_ids[3..input_ids.len() - 5].to_vec();
-        let prefill = self.build_custom_voice_prefill(&content_ids, speaker, language)?;
-        let mut trailing = content_ids.get(1..).unwrap_or_default().to_vec();
+        let lookahead = if content_ids.is_empty() {
+            0
+        } else {
+            text_lookahead_tokens.min(content_ids.len()).max(1)
+        };
+        let prefill =
+            self.build_custom_voice_prefill(&content_ids[..lookahead], speaker, language)?;
+        let mut trailing = content_ids.get(lookahead..).unwrap_or_default().to_vec();
         trailing.push(self.config.tokens.tts_eos as u32);
         let trailing_text = self.projected_text_embeddings(&trailing)?;
         let tts_pad_embed = self.projected_text_embeddings(&[self.config.tokens.tts_pad as u32])?;
@@ -394,8 +415,7 @@ impl CustomVoiceTextPrep {
         let tts = self
             .projected_text_embeddings(&[tts_pad, tts_pad, tts_pad, tts_pad, tts_pad, tts_bos])?;
 
-        let mut hidden =
-            Vec::with_capacity((9 + usize::from(!text_tokens.is_empty())) * self.hidden);
+        let mut hidden = Vec::with_capacity((9 + text_tokens.len()) * self.hidden);
         hidden.extend(role_prefix);
         for idx in 0..6 {
             hidden.extend(add_rows(
@@ -403,9 +423,13 @@ impl CustomVoiceTextPrep {
                 &codec[idx * self.hidden..(idx + 1) * self.hidden],
             ));
         }
-        if let Some(&first_text) = text_tokens.first() {
-            let text = self.projected_text_embeddings(&[first_text])?;
-            hidden.extend(add_rows(&text, &codec[6 * self.hidden..7 * self.hidden]));
+        let text = self.projected_text_embeddings(text_tokens)?;
+        for idx in 0..text_tokens.len() {
+            let codec_idx = if idx + 1 == text_tokens.len() { 6 } else { 5 };
+            hidden.extend(add_rows(
+                &text[idx * self.hidden..(idx + 1) * self.hidden],
+                &codec[codec_idx * self.hidden..(codec_idx + 1) * self.hidden],
+            ));
         }
         Ok(hidden)
     }

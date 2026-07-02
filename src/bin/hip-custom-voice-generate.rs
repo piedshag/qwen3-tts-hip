@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use qwen3_hip_runtime::codec::write_wav;
-use qwen3_hip_runtime::generation::{GenerateOptions, HipTtsEngine, Language, Speaker};
+use qwen3_hip_runtime::generation::{
+    DEFAULT_TEXT_LOOKAHEAD_TOKENS, GenerateOptions, HipTtsEngine, Language, Speaker,
+};
 use qwen3_hip_runtime::{Error, Result};
 
 const CODE_GROUPS: usize = 16;
@@ -52,9 +54,16 @@ fn main() -> Result<()> {
     let subtalker_top_p = parse_f32_arg(args.next(), "subtalker_top_p")?.unwrap_or(1.0);
     let subtalker_temperature = parse_f32_arg(args.next(), "subtalker_temperature")?.unwrap_or(0.9);
     let seed = parse_u64_arg(args.next(), "seed")?.unwrap_or(0);
+    let text_lookahead_tokens =
+        parse_arg(args.next(), "text_lookahead_tokens")?.unwrap_or(DEFAULT_TEXT_LOOKAHEAD_TOKENS);
     if max_frames == 0 {
         return Err(Error::InvalidInput(
             "max_frames must be non-zero".to_string(),
+        ));
+    }
+    if text_lookahead_tokens == 0 {
+        return Err(Error::InvalidInput(
+            "text_lookahead_tokens must be non-zero".to_string(),
         ));
     }
 
@@ -81,6 +90,7 @@ fn main() -> Result<()> {
             subtalker_top_p,
             subtalker_temperature,
             seed,
+            text_lookahead_tokens,
         },
     )?;
     let generation_seconds = generation_start.elapsed().as_secs_f64();

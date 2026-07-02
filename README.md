@@ -64,6 +64,7 @@ fn main() -> qwen3_hip_runtime::Result<()> {
             subtalker_top_p: 1.0,
             subtalker_temperature: 0.9,
             seed: 0,
+            text_lookahead_tokens: 8,
         },
     )?;
 
@@ -74,6 +75,13 @@ fn main() -> qwen3_hip_runtime::Result<()> {
 
 If you need a fixed KV-cache capacity independent of a single request's frame cap,
 use `HipTtsEngine::load_with_options(...)` and set `EngineOptions::max_cache_steps`.
+
+Useful generation options:
+
+- `max_frames`: maximum generated acoustic frames; each frame is 1,920 samples, or 80 ms at 24 kHz.
+- `text_lookahead_tokens`: number of initial text tokens to include in the streaming prefill. The default is `8`; use `1` for the lowest-latency streaming-style path or larger values for more initial text context.
+- `do_sample`, `top_k`, `top_p`, `temperature`, `repetition_penalty`: semantic token sampling controls.
+- `subtalker_dosample`, `subtalker_top_k`, `subtalker_top_p`, `subtalker_temperature`: acoustic CodePredictor sampling controls.
 
 For incremental generation, create a persistent stream and pull code or audio chunks:
 
