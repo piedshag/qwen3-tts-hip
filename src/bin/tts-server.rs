@@ -7,6 +7,7 @@ use std::time::Instant;
 use qwen3_hip_runtime::generation::{DEFAULT_TEXT_LOOKAHEAD_TOKENS, SAMPLE_RATE};
 use qwen3_hip_runtime::{
     Error, GenerateOptions, GeneratedSpeech, HipTtsEngine, Language, Result, Speaker,
+    VoiceClonePrompt,
 };
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
@@ -16,6 +17,7 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 struct ServerState {
     engine: HipTtsEngine,
+    voice_clone_prompt: Option<VoiceClonePrompt>,
     load_seconds: f64,
     max_cache_frames: usize,
 }
@@ -32,13 +34,14 @@ struct GenerationRequest {
     options: GenerateOptions,
     wav_gain: f32,
     stream_chunk_frames: usize,
+    use_voice_clone: bool,
 }
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let model_dir = args.next().map(PathBuf::from).ok_or_else(|| {
         Error::InvalidInput(
-            "usage: cargo run --release --bin tts-server -- <model_dir> [bind_addr] [max_cache_frames]"
+            "usage: cargo run --release --bin tts-server -- <model_dir> [bind_addr] [max_cache_frames] [voice_clone_prompt_json]"
                 .to_string(),
         )
     })?;
@@ -48,11 +51,16 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| DEFAULT_BIND.to_string());
     let max_cache_frames =
         parse_usize_arg(args.next(), "max_cache_frames")?.unwrap_or(DEFAULT_MAX_CACHE_FRAMES);
+    let voice_clone_prompt_path = args.next().map(PathBuf::from);
     if max_cache_frames == 0 {
         return Err(Error::InvalidInput(
             "max_cache_frames must be non-zero".to_string(),
         ));
     }
+    let voice_clone_prompt = voice_clone_prompt_path
+        .as_deref()
+        .map(VoiceClonePrompt::from_json)
+        .transpose()?;
 
     let load_start = Instant::now();
     let engine = HipTtsEngine::load_with_max_frames(&model_dir, 0, max_cache_frames)?;
@@ -60,14 +68,19 @@ fn main() -> Result<()> {
     let load_seconds = load_start.elapsed().as_secs_f64();
     let state = ServerState {
         engine,
+        voice_clone_prompt,
         load_seconds,
         max_cache_frames,
     };
 
     let listener = TcpListener::bind(&bind).map_err(io_error)?;
     println!(
-        "TTS server listening on http://{bind}/, model_dir={}, load_seconds={load_seconds:.6}, max_cache_frames={max_cache_frames}",
-        model_dir.display()
+        "TTS server listening on http://{bind}/, model_dir={}, load_seconds={load_seconds:.6}, max_cache_frames={max_cache_frames}, voice_clone_prompt={}",
+        model_dir.display(),
+        voice_clone_prompt_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_string())
     );
 
     for stream in listener.incoming() {
@@ -119,7 +132,16 @@ fn handle_generate(state: &ServerState, stream: &mut TcpStream, request: &Reques
     let options = request.options;
 
     let generation_start = Instant::now();
-    let generated = state.engine.generate_codes(text, options.clone())?;
+    let generated = if request.use_voice_clone {
+        let prompt = state.voice_clone_prompt.as_ref().ok_or_else(|| {
+            Error::InvalidInput("server was not started with a voice clone prompt".to_string())
+        })?;
+        state
+            .engine
+            .generate_voice_clone_codes(text, prompt, options.clone())?
+    } else {
+        state.engine.generate_codes(text, options.clone())?
+    };
     let generation_seconds = generation_start.elapsed().as_secs_f64();
 
     let decode_start = Instant::now();
@@ -137,6 +159,7 @@ fn handle_generate(state: &ServerState, stream: &mut TcpStream, request: &Reques
     };
     let wav = speech.to_wav_bytes(request.wav_gain)?;
     let wav_seconds = wav_start.elapsed().as_secs_f64();
+    let time_to_first_audio_seconds = generation_start.elapsed().as_secs_f64();
 
     let audio_seconds = speech.audio_seconds();
     let inference_seconds = generation_seconds + decode_seconds;
@@ -145,7 +168,8 @@ fn handle_generate(state: &ServerState, stream: &mut TcpStream, request: &Reques
     let inference_rtf = rtf(inference_seconds, audio_seconds);
 
     println!(
-        "generated: frames={}, samples={}, ended_by_eos={}, generation_seconds={generation_seconds:.6}, decode_seconds={decode_seconds:.6}, wav_seconds={wav_seconds:.6}, audio_seconds={audio_seconds:.6}, inference_rtf={inference_rtf:.6}",
+        "generated: voice_clone={}, frames={}, samples={}, ended_by_eos={}, time_to_first_audio_seconds={time_to_first_audio_seconds:.6}, generation_seconds={generation_seconds:.6}, decode_seconds={decode_seconds:.6}, wav_seconds={wav_seconds:.6}, audio_seconds={audio_seconds:.6}, inference_rtf={inference_rtf:.6}",
+        request.use_voice_clone,
         speech.frames,
         speech.samples.len(),
         speech.ended_by_eos,
@@ -161,6 +185,10 @@ fn handle_generate(state: &ServerState, stream: &mut TcpStream, request: &Reques
         ),
         ("X-TTS-Decode-Seconds", format_seconds(decode_seconds)),
         ("X-TTS-Wav-Seconds", format_seconds(wav_seconds)),
+        (
+            "X-TTS-Time-To-First-Audio-Seconds",
+            format_seconds(time_to_first_audio_seconds),
+        ),
         ("X-TTS-Inference-Seconds", format_seconds(inference_seconds)),
         ("X-TTS-Audio-Seconds", format_seconds(audio_seconds)),
         ("X-TTS-Generation-RTF", format_seconds(generation_rtf)),
@@ -169,6 +197,7 @@ fn handle_generate(state: &ServerState, stream: &mut TcpStream, request: &Reques
         ("X-TTS-Frames", speech.frames.to_string()),
         ("X-TTS-Samples", speech.samples.len().to_string()),
         ("X-TTS-Ended-By-EOS", speech.ended_by_eos.to_string()),
+        ("X-TTS-Voice-Clone", request.use_voice_clone.to_string()),
         (
             "X-TTS-Repetition-Penalty",
             format_seconds(options.repetition_penalty as f64),
@@ -221,9 +250,18 @@ fn handle_stream(state: &ServerState, stream: &mut TcpStream, request: &Request)
         return Ok(());
     };
     let start = Instant::now();
-    let mut tts_stream = state
-        .engine
-        .start_stream(&request.text, request.options.clone())?;
+    let mut tts_stream = if request.use_voice_clone {
+        let prompt = state.voice_clone_prompt.as_ref().ok_or_else(|| {
+            Error::InvalidInput("server was not started with a voice clone prompt".to_string())
+        })?;
+        state
+            .engine
+            .start_voice_clone_stream(&request.text, prompt, request.options.clone())?
+    } else {
+        state
+            .engine
+            .start_stream(&request.text, request.options.clone())?
+    };
     send_chunked_headers(
         stream,
         200,
@@ -241,13 +279,18 @@ fn handle_stream(state: &ServerState, stream: &mut TcpStream, request: &Request)
                 "X-TTS-Text-Lookahead-Tokens",
                 request.options.text_lookahead_tokens.to_string(),
             ),
+            ("X-TTS-Voice-Clone", request.use_voice_clone.to_string()),
         ],
     )?;
 
     let mut total_samples = 0usize;
     let mut total_frames = 0usize;
     let mut ended_by_eos = false;
+    let mut time_to_first_audio_seconds = None;
     while let Some(chunk) = tts_stream.next_audio_chunk(request.stream_chunk_frames)? {
+        if time_to_first_audio_seconds.is_none() && !chunk.samples.is_empty() {
+            time_to_first_audio_seconds = Some(start.elapsed().as_secs_f64());
+        }
         total_samples += chunk.samples.len();
         total_frames = chunk.total_frames;
         ended_by_eos = chunk.ended_by_eos;
@@ -259,7 +302,11 @@ fn handle_stream(state: &ServerState, stream: &mut TcpStream, request: &Request)
     let seconds = start.elapsed().as_secs_f64();
     let audio_seconds = total_samples as f64 / SAMPLE_RATE as f64;
     println!(
-        "streamed: frames={total_frames}, samples={total_samples}, ended_by_eos={ended_by_eos}, seconds={seconds:.6}, audio_seconds={audio_seconds:.6}, rtf={:.6}",
+        "streamed: voice_clone={}, frames={total_frames}, samples={total_samples}, ended_by_eos={ended_by_eos}, time_to_first_audio_seconds={}, seconds={seconds:.6}, audio_seconds={audio_seconds:.6}, rtf={:.6}",
+        request.use_voice_clone,
+        time_to_first_audio_seconds
+            .map(format_seconds)
+            .unwrap_or_else(|| "n/a".to_string()),
         rtf(seconds, audio_seconds)
     );
     Ok(())
@@ -377,6 +424,17 @@ fn parse_generation_request(state: &ServerState, request: &Request) -> Result<Ge
             "stream_chunk_frames must be non-zero".to_string(),
         ));
     }
+    let use_voice_clone = form
+        .get("use_voice_clone")
+        .map(|value| parse_bool(value, "use_voice_clone"))
+        .transpose()?
+        .unwrap_or(false);
+    if use_voice_clone && state.voice_clone_prompt.is_none() {
+        return Err(Error::InvalidInput(
+            "voice clone mode requires starting the server with voice_clone_prompt_json"
+                .to_string(),
+        ));
+    }
 
     Ok(GenerationRequest {
         text,
@@ -399,6 +457,7 @@ fn parse_generation_request(state: &ServerState, request: &Request) -> Result<Ge
         },
         wav_gain,
         stream_chunk_frames,
+        use_voice_clone,
     })
 }
 
@@ -609,6 +668,7 @@ fn index_html(state: &ServerState) -> String {
     <span class="pill">model load: {load_seconds:.3}s</span>
     <span class="pill">max cache frames: {max_cache_frames}</span>
     <span class="pill">sample rate: {sample_rate} Hz</span>
+    <span class="pill">voice clone prompt: {voice_clone_prompt_status}</span>
   </div>
   <form id="tts-form">
     <label>Text
@@ -621,6 +681,12 @@ fn index_html(state: &ServerState) -> String {
       <label>Speaker
         <select name="speaker">
           <option>Ryan</option><option>Serena</option><option>Vivian</option><option>UncleFu</option><option>Aiden</option><option>OnoAnna</option><option>Sohee</option><option>Eric</option><option>Dylan</option>
+        </select>
+      </label>
+      <label>Voice mode
+        <select name="use_voice_clone">
+          <option value="false">Built-in speaker</option>
+          <option value="true" {voice_clone_disabled}>Voice clone prompt</option>
         </select>
       </label>
       <label>Language
@@ -691,6 +757,7 @@ const statHeaders = [
   ['generation_seconds', 'x-tts-generation-seconds'],
   ['decode_seconds', 'x-tts-decode-seconds'],
   ['wav_seconds', 'x-tts-wav-seconds'],
+  ['time_to_first_audio_seconds', 'x-tts-time-to-first-audio-seconds'],
   ['inference_seconds', 'x-tts-inference-seconds'],
   ['audio_seconds', 'x-tts-audio-seconds'],
   ['generation_rtf', 'x-tts-generation-rtf'],
@@ -699,6 +766,7 @@ const statHeaders = [
   ['frames', 'x-tts-frames'],
   ['samples', 'x-tts-samples'],
   ['ended_by_eos', 'x-tts-ended-by-eos'],
+  ['voice_clone', 'x-tts-voice-clone'],
   ['repetition_penalty', 'x-tts-repetition-penalty'],
   ['do_sample', 'x-tts-do-sample'],
   ['top_k', 'x-tts-top-k'],
@@ -718,16 +786,20 @@ form.addEventListener('submit', async (event) => {{
   streamButton.disabled = true;
   stats.textContent = 'Generating...';
   try {{
+    const requestStart = performance.now();
     const response = await fetch('/api/generate', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
       body: new URLSearchParams(new FormData(form)),
     }});
+    const responseHeadersSeconds = (performance.now() - requestStart) / 1000;
     if (!response.ok) {{
       throw new Error(await response.text());
     }}
     const values = Object.fromEntries(statHeaders.map(([name, header]) => [name, response.headers.get(header)]));
     const blob = await response.blob();
+    values.client_response_headers_seconds = responseHeadersSeconds.toFixed(3);
+    values.client_wav_loaded_seconds = ((performance.now() - requestStart) / 1000).toFixed(3);
     if (currentUrl) URL.revokeObjectURL(currentUrl);
     currentUrl = URL.createObjectURL(blob);
     audio.src = currentUrl;
@@ -745,11 +817,13 @@ streamButton.addEventListener('click', async () => {{
   streamButton.disabled = true;
   stats.textContent = 'Starting stream...';
   try {{
+    const requestStart = performance.now();
     const response = await fetch('/api/stream', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/x-www-form-urlencoded' }},
       body: new URLSearchParams(new FormData(form)),
     }});
+    const responseHeadersSeconds = (performance.now() - requestStart) / 1000;
     if (!response.ok) {{
       throw new Error(await response.text());
     }}
@@ -761,6 +835,7 @@ streamButton.addEventListener('click', async () => {{
     let nextTime = context.currentTime + 0.08;
     let chunks = 0;
     let samples = 0;
+    let firstAudioSeconds = null;
     while (true) {{
       const {{ done, value }} = await reader.read();
       if (done) break;
@@ -779,6 +854,7 @@ streamButton.addEventListener('click', async () => {{
       }}
       const frameCount = bytes.length / 2;
       if (!frameCount) continue;
+      if (firstAudioSeconds === null) firstAudioSeconds = (performance.now() - requestStart) / 1000;
       const floats = new Float32Array(frameCount);
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       for (let i = 0; i < frameCount; i++) {{
@@ -799,6 +875,8 @@ streamButton.addEventListener('click', async () => {{
         chunks,
         samples,
         audio_seconds: (samples / sampleRate).toFixed(3),
+        client_response_headers_seconds: responseHeadersSeconds.toFixed(3),
+        client_time_to_first_audio_seconds: firstAudioSeconds === null ? null : firstAudioSeconds.toFixed(3),
       }}, null, 2);
     }}
   }} catch (error) {{
@@ -817,6 +895,16 @@ streamButton.addEventListener('click', async () => {{
         sample_rate = SAMPLE_RATE,
         default_stream_chunk_frames = DEFAULT_STREAM_CHUNK_FRAMES,
         default_text_lookahead_tokens = DEFAULT_TEXT_LOOKAHEAD_TOKENS,
+        voice_clone_prompt_status = if state.voice_clone_prompt.is_some() {
+            "loaded"
+        } else {
+            "none"
+        },
+        voice_clone_disabled = if state.voice_clone_prompt.is_some() {
+            ""
+        } else {
+            "disabled"
+        },
     )
 }
 

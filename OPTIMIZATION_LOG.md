@@ -3,6 +3,61 @@
 Running notes for performance work on the HIP runtime. Keep entries factual:
 what changed, how it was measured, and what we learned.
 
+## 2026-07-02
+
+### Base X-Vector Voice Clone Smoke
+
+Added a first Base-model voice-clone path that loads precomputed x-vector-only
+prompt JSON artifacts exported from the Python reference. This reuses the existing
+streaming-style text prefill and replaces the CustomVoice speaker-token embedding
+with the exported `ref_spk_embedding`. ICL/ref-code prompting and Rust-side
+reference-audio encoding are still future work.
+
+Prompt export used a local 10-second reference clip against the cached 1.7B Base
+snapshot.
+
+Rust smoke command used `cargo run --profile timing --bin hip-custom-voice-generate`
+with the 1.7B Base model, `max_frames=80`, Qwen-default sampling, and
+`text_lookahead_tokens=8`.
+
+```text
+frames=70
+ended_by_eos=true
+audio_seconds=5.600000
+generation_seconds=2.952218
+decode_seconds=0.327853
+inference_seconds=3.280071
+generation_rtf=0.527182
+decode_rtf=0.058545
+inference_rtf=0.585727
+output_wav=/tmp/opencode/voice-clone-xvector-rust.wav
+```
+
+Discovery: Base model loading works with the existing 1.7B model assumptions, and
+the x-vector-only prompt path generates valid audio with EOS termination. For exact
+reference parity, use `text_lookahead_tokens=1`; the default `8` keeps the current
+streaming-quality tradeoff.
+
+### X-Vector Voice Clone Parity
+
+Added `python-reference/qwen3_tts_reference.py voice-clone` to export Base-model
+voice-clone codes from a precomputed x-vector prompt JSON, plus
+`scripts/qwen3-hip-voice-clone-parity.sh` to rerun the Python export and compare
+Rust generation with sampling disabled.
+
+Measured with cached 1.7B Base, `max_new_tokens=12`, streaming-style Python input,
+greedy semantic and acoustic generation, repetition penalty `1.0`, and Rust
+`text_lookahead_tokens=1`.
+
+```text
+python_frames=11
+rust_frames=11
+codes_match=true
+```
+
+Discovery: the Rust x-vector-only prefill path matches Python exactly for the tested
+deterministic Base-model rollout.
+
 ## 2026-06-28
 
 ### Baseline Release RTF

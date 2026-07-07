@@ -210,6 +210,8 @@ def run_voice_design(args: argparse.Namespace) -> None:
 
 
 def run_voice_clone_prompt(args: argparse.Namespace) -> None:
+    import numpy as np
+
     tts = load_tts(args)
     items = tts.create_voice_clone_prompt(
         ref_audio=args.ref_audio,
@@ -230,7 +232,88 @@ def run_voice_clone_prompt(args: argparse.Namespace) -> None:
     }
     if item.ref_code is not None:
         prompt_stats["ref_code"] = save_array(args.out / "ref_code.npy", item.ref_code)
+    ref_codes = None
+    if item.ref_code is not None:
+        ref_codes = np.rint(tensor_to_numpy(item.ref_code)).astype(np.int32).reshape(-1).tolist()
+    save_json(
+        args.out / "prompt.json",
+        {
+            "speaker_embedding": tensor_to_numpy(item.ref_spk_embedding).reshape(-1).tolist(),
+            "x_vector_only_mode": bool(item.x_vector_only_mode),
+            "icl_mode": bool(item.icl_mode),
+            "ref_text": item.ref_text,
+            "ref_codes": ref_codes,
+        },
+    )
     save_json(args.out / "metadata.json", prompt_stats)
+
+
+def load_voice_clone_prompt_json(path: Path, device: str, dtype_name: str) -> dict[str, Any]:
+    import torch
+
+    raw = json.loads(path.read_text())
+    dtype = dtype_from_name(dtype_name)
+    ref_codes = raw.get("ref_codes", None)
+    if ref_codes is not None:
+        if len(ref_codes) % 16 != 0:
+            raise ValueError(f"ref_codes length must be divisible by 16, got {len(ref_codes)}")
+        ref_codes = torch.tensor(ref_codes, device=device, dtype=torch.long).view(-1, 16)
+    return {
+        "ref_code": [ref_codes],
+        "ref_spk_embedding": [
+            torch.tensor(raw["speaker_embedding"], device=device, dtype=dtype)
+        ],
+        "x_vector_only_mode": [bool(raw.get("x_vector_only_mode", False))],
+        "icl_mode": [bool(raw.get("icl_mode", False))],
+    }
+
+
+def run_voice_clone(args: argparse.Namespace) -> None:
+    import soundfile as sf
+    import torch
+
+    torch.manual_seed(args.seed)
+    tts = load_tts(args)
+    input_ids = tts._tokenize_texts([tts._build_assistant_text(args.text)])
+    prompt = load_voice_clone_prompt_json(Path(args.prompt_json), args.device, args.dtype)
+    generate_args = generation_kwargs(tts, args)
+
+    maybe_sync(args.device)
+    with torch.inference_mode():
+        codes_list, extra = tts.model.generate(
+            input_ids=input_ids,
+            ref_ids=None,
+            voice_clone_prompt=prompt,
+            languages=[args.language],
+            non_streaming_mode=args.non_streaming_mode,
+            **generate_args,
+        )
+        wavs, sample_rate = tts.model.speech_tokenizer.decode([{"audio_codes": codes_list[0]}])
+    maybe_sync(args.device)
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    code_stats = save_array(args.out / "talker_codes.npy", codes_list[0])
+    hidden_stats = None
+    if isinstance(extra, list) and extra:
+        hidden_stats = save_array(args.out / "talker_hidden_states.npy", extra[0])
+    wav_stats = save_array(args.out / "waveform.npy", wavs[0])
+    sf.write(args.out / "output.wav", wavs[0], sample_rate)
+    save_json(
+        args.out / "metadata.json",
+        {
+            "mode": "voice-clone",
+            "model": args.model,
+            "text": args.text,
+            "language": args.language,
+            "prompt_json": str(args.prompt_json),
+            "sample_rate": int(sample_rate),
+            "wav": wav_stats,
+            "talker_codes": code_stats,
+            "talker_hidden_states": hidden_stats,
+            "extra_type": type(extra).__name__,
+            "generation_kwargs": generate_args,
+        },
+    )
 
 
 def run_custom_voice_talker(args: argparse.Namespace) -> None:
@@ -649,6 +732,12 @@ def build_parser() -> argparse.ArgumentParser:
     clone.add_argument("--ref-text", default="")
     clone.add_argument("--x-vector-only", action="store_true")
     clone.set_defaults(func=run_voice_clone_prompt)
+
+    clone_run = subcommands.add_parser("voice-clone")
+    add_common_model_args(clone_run)
+    add_generation_args(clone_run)
+    clone_run.add_argument("--prompt-json", type=Path, required=True)
+    clone_run.set_defaults(func=run_voice_clone)
 
     tokenizer = subcommands.add_parser("tokenizer")
     tokenizer.add_argument("--repo", type=Path, default=DEFAULT_REPO)

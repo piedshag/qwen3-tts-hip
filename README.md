@@ -1,6 +1,7 @@
 # qwen3-tts-hip
 
-Standalone Rust + ROCm/HIP runtime for Qwen3-TTS CustomVoice inference on AMD GPUs.
+Standalone Rust + ROCm/HIP runtime for Qwen3-TTS CustomVoice and Base x-vector
+voice-clone inference on AMD GPUs.
 
 This crate provides a high-level text-to-speech API backed by custom HIP kernels,
 rocBLAS GEMMs, HIPRTC compilation, and a native HIP codec decoder. The lower-level
@@ -14,7 +15,8 @@ normal callers should use `HipTtsEngine`.
 
 ## Status
 
-- Supports Qwen3-TTS 12 Hz CustomVoice 0.6B and basic 1.7B loading/generation.
+- Supports Qwen3-TTS 12 Hz CustomVoice 0.6B, basic CustomVoice 1.7B, and
+  precomputed x-vector voice-clone prompts on Base models.
 - 0.6B deterministic generation matches exported Python fixtures exactly.
 - Native HIP codec waveform parity passes against Python codec-stage fixtures.
 - Hot 0.6B streaming generation with Qwen-default sampling is about `0.54` RTF on the local R9700 test system.
@@ -82,6 +84,42 @@ Useful generation options:
 - `text_lookahead_tokens`: number of initial text tokens to include in the streaming prefill. The default is `8`; use `1` for the lowest-latency streaming-style path or larger values for more initial text context.
 - `do_sample`, `top_k`, `top_p`, `temperature`, `repetition_penalty`: semantic token sampling controls.
 - `subtalker_dosample`, `subtalker_top_k`, `subtalker_top_p`, `subtalker_temperature`: acoustic CodePredictor sampling controls.
+
+Base-model voice cloning currently supports precomputed x-vector-only prompt JSON
+artifacts. Export one with the Python reference helper, then load it with
+`VoiceClonePrompt::from_json(...)` and call `HipTtsEngine::generate_voice_clone(...)`.
+Full reference-audio encoding and ICL/ref-code prompting are not ported to Rust yet.
+
+```rust,no_run
+use qwen3_hip_runtime::{GenerateOptions, HipTtsEngine, VoiceClonePrompt};
+
+fn main() -> qwen3_hip_runtime::Result<()> {
+    let engine = HipTtsEngine::load_with_max_frames("/path/to/Qwen3-TTS-12Hz-1.7B-Base", 0, 240)?;
+    let prompt = VoiceClonePrompt::from_json("prompt.json")?;
+    let speech = engine.generate_voice_clone(
+        "We are going to build something tremendous.",
+        &prompt,
+        GenerateOptions::default(),
+    )?;
+    speech.write_wav("clone.wav", 1.0)?;
+    Ok(())
+}
+```
+
+Run deterministic x-vector voice-clone parity from a prompt artifact:
+
+```bash
+QWEN3_VOICE_CLONE_PROMPT_JSON=/path/to/prompt.json \
+  ./scripts/qwen3-hip-voice-clone-parity.sh
+```
+
+The parity script exports Python Base-model codes with sampling disabled and compares
+Rust generation against the exported `.npy` using `text_lookahead_tokens=1`.
+
+The std-only HTTP demo server also supports the same precomputed x-vector prompt.
+Start `tts-server` with the Base model and pass the prompt JSON as the optional fourth
+argument. The browser UI then exposes a voice-mode selector for both WAV generation
+and PCM streaming.
 
 For incremental generation, create a persistent stream and pull code or audio chunks:
 

@@ -5,6 +5,7 @@ use std::time::Instant;
 use qwen3_hip_runtime::codec::write_wav;
 use qwen3_hip_runtime::generation::{
     DEFAULT_TEXT_LOOKAHEAD_TOKENS, GenerateOptions, HipTtsEngine, Language, Speaker,
+    VoiceClonePrompt,
 };
 use qwen3_hip_runtime::{Error, Result};
 
@@ -56,6 +57,10 @@ fn main() -> Result<()> {
     let seed = parse_u64_arg(args.next(), "seed")?.unwrap_or(0);
     let text_lookahead_tokens =
         parse_arg(args.next(), "text_lookahead_tokens")?.unwrap_or(DEFAULT_TEXT_LOOKAHEAD_TOKENS);
+    let voice_clone_prompt_path = args.next().and_then(|value| {
+        let text = value.to_string_lossy();
+        (!matches!(text.as_ref(), "none" | "-")).then(|| PathBuf::from(value))
+    });
     if max_frames == 0 {
         return Err(Error::InvalidInput(
             "max_frames must be non-zero".to_string(),
@@ -73,26 +78,32 @@ fn main() -> Result<()> {
     let load_seconds = load_start.elapsed().as_secs_f64();
 
     let generation_start = Instant::now();
-    let generated = engine.generate_codes(
-        &text,
-        GenerateOptions {
-            speaker,
-            language,
-            max_frames,
-            decode_audio: false,
-            do_sample,
-            top_k,
-            top_p,
-            temperature,
-            repetition_penalty,
-            subtalker_dosample,
-            subtalker_top_k,
-            subtalker_top_p,
-            subtalker_temperature,
-            seed,
-            text_lookahead_tokens,
-        },
-    )?;
+    let options = GenerateOptions {
+        speaker,
+        language,
+        max_frames,
+        decode_audio: false,
+        do_sample,
+        top_k,
+        top_p,
+        temperature,
+        repetition_penalty,
+        subtalker_dosample,
+        subtalker_top_k,
+        subtalker_top_p,
+        subtalker_temperature,
+        seed,
+        text_lookahead_tokens,
+    };
+    let voice_clone_prompt = voice_clone_prompt_path
+        .as_deref()
+        .map(VoiceClonePrompt::from_json)
+        .transpose()?;
+    let generated = if let Some(prompt) = voice_clone_prompt.as_ref() {
+        engine.generate_voice_clone_codes(&text, prompt, options)?
+    } else {
+        engine.generate_codes(&text, options)?
+    };
     let generation_seconds = generation_start.elapsed().as_secs_f64();
 
     if let Some(path) = reference_codes.as_deref() {
@@ -135,7 +146,12 @@ fn main() -> Result<()> {
         .then_some(samples.len() as f64 / qwen3_hip_runtime::generation::SAMPLE_RATE as f64);
     let inference_seconds = generation_seconds + decode_seconds.unwrap_or(0.0);
     println!(
-        "HIP custom voice generate OK: text={text:?}, speaker={speaker:?}, language={language:?}, frames={}, ended_by_eos={}, samples={}, output_wav={:?}, load_seconds={load_seconds:.6}, generation_seconds={generation_seconds:.6}, decode_seconds={}, write_seconds={}, inference_seconds={inference_seconds:.6}, audio_seconds={}, generation_rtf={}, decode_rtf={}, inference_rtf={}, first_frame={:?}, last_frame={:?}",
+        "HIP {} generate OK: text={text:?}, speaker={speaker:?}, language={language:?}, frames={}, ended_by_eos={}, samples={}, output_wav={:?}, load_seconds={load_seconds:.6}, generation_seconds={generation_seconds:.6}, decode_seconds={}, write_seconds={}, inference_seconds={inference_seconds:.6}, audio_seconds={}, generation_rtf={}, decode_rtf={}, inference_rtf={}, first_frame={:?}, last_frame={:?}",
+        if voice_clone_prompt.is_some() {
+            "voice clone"
+        } else {
+            "custom voice"
+        },
         generated.frames,
         generated.ended_by_eos,
         samples.len(),

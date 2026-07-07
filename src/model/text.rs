@@ -24,6 +24,47 @@ pub struct CustomVoiceInputs {
     pub tts_pad_embed: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VoiceClonePrompt {
+    pub speaker_embedding: Vec<f32>,
+    pub x_vector_only_mode: bool,
+    pub icl_mode: bool,
+    pub ref_text: Option<String>,
+    pub ref_codes: Option<Vec<i32>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VoiceClonePromptJson {
+    speaker_embedding: Vec<f32>,
+    #[serde(default)]
+    x_vector_only_mode: bool,
+    #[serde(default)]
+    icl_mode: bool,
+    #[serde(default)]
+    ref_text: Option<String>,
+    #[serde(default)]
+    ref_codes: Option<Vec<i32>>,
+}
+
+impl VoiceClonePrompt {
+    pub fn from_json(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).map_err(|err| {
+            Error::InvalidInput(format!("failed to read {}: {err}", path.display()))
+        })?;
+        let raw: VoiceClonePromptJson = serde_json::from_slice(&bytes).map_err(|err| {
+            Error::InvalidInput(format!("failed to parse {}: {err}", path.display()))
+        })?;
+        Ok(Self {
+            speaker_embedding: raw.speaker_embedding,
+            x_vector_only_mode: raw.x_vector_only_mode,
+            icl_mode: raw.icl_mode,
+            ref_text: raw.ref_text,
+            ref_codes: raw.ref_codes,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     Chinese,
@@ -380,36 +421,125 @@ impl CustomVoiceTextPrep {
         })
     }
 
+    pub fn prepare_voice_clone_xvector_with_lookahead(
+        &self,
+        text: &str,
+        prompt: &VoiceClonePrompt,
+        language: Language,
+        text_lookahead_tokens: usize,
+    ) -> Result<CustomVoiceInputs> {
+        if !prompt.x_vector_only_mode || prompt.icl_mode || prompt.ref_codes.is_some() {
+            return Err(Error::InvalidInput(
+                "only x-vector-only voice clone prompts are supported for now".to_string(),
+            ));
+        }
+        if prompt.speaker_embedding.len() != self.hidden {
+            return Err(Error::InvalidInput(format!(
+                "speaker embedding length {} does not match model hidden {}",
+                prompt.speaker_embedding.len(),
+                self.hidden
+            )));
+        }
+        if text_lookahead_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "text_lookahead_tokens must be non-zero".to_string(),
+            ));
+        }
+
+        let assistant_text =
+            format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n");
+        let input_ids = self.tokenizer.encode(&assistant_text)?;
+        if input_ids.len() < 8 {
+            return Err(Error::InvalidInput(format!(
+                "formatted prompt is too short: {} tokens",
+                input_ids.len()
+            )));
+        }
+        let content_ids = input_ids[3..input_ids.len() - 5].to_vec();
+        let lookahead = if content_ids.is_empty() {
+            0
+        } else {
+            text_lookahead_tokens.min(content_ids.len()).max(1)
+        };
+        let prefill = self.build_voice_clone_xvector_prefill(
+            &content_ids[..lookahead],
+            &prompt.speaker_embedding,
+            language,
+        )?;
+        let mut trailing = content_ids.get(lookahead..).unwrap_or_default().to_vec();
+        trailing.push(self.config.tokens.tts_eos as u32);
+        let trailing_text = self.projected_text_embeddings(&trailing)?;
+        let tts_pad_embed = self.projected_text_embeddings(&[self.config.tokens.tts_pad as u32])?;
+        Ok(CustomVoiceInputs {
+            input_ids,
+            content_ids,
+            prefill_steps: prefill.len() / self.hidden,
+            prefill,
+            trailing_steps: trailing.len(),
+            trailing_text,
+            tts_pad_embed,
+        })
+    }
+
     fn build_custom_voice_prefill(
         &self,
         text_tokens: &[u32],
         speaker: Speaker,
         language: Language,
     ) -> Result<Vec<f32>> {
-        let language_id = self.token_id(
-            "language",
-            language.config_key(),
-            &self.config.tokens.language_ids,
-        )?;
         let speaker_id = self.token_id(
             "speaker",
             speaker.config_key(),
             &self.config.tokens.speaker_ids,
+        )?;
+        let speaker_embedding = self.codec_embeddings(&[speaker_id as u32])?;
+        self.build_prefill_with_speaker_embedding(text_tokens, &speaker_embedding, language)
+    }
+
+    fn build_voice_clone_xvector_prefill(
+        &self,
+        text_tokens: &[u32],
+        speaker_embedding: &[f32],
+        language: Language,
+    ) -> Result<Vec<f32>> {
+        self.build_prefill_with_speaker_embedding(text_tokens, speaker_embedding, language)
+    }
+
+    fn build_prefill_with_speaker_embedding(
+        &self,
+        text_tokens: &[u32],
+        speaker_embedding: &[f32],
+        language: Language,
+    ) -> Result<Vec<f32>> {
+        if speaker_embedding.len() != self.hidden {
+            return Err(Error::InvalidInput(format!(
+                "speaker embedding length {} does not match hidden {}",
+                speaker_embedding.len(),
+                self.hidden
+            )));
+        }
+        let language_id = self.token_id(
+            "language",
+            language.config_key(),
+            &self.config.tokens.language_ids,
         )?;
         let role_prefix = self.projected_text_embeddings(&[
             self.config.tokens.im_start as u32,
             self.config.tokens.assistant as u32,
             NEWLINE,
         ])?;
-        let codec = self.codec_embeddings(&[
+        let codec_prefix = self.codec_embeddings(&[
             self.config.tokens.codec_think as u32,
             self.config.tokens.codec_think_bos as u32,
             language_id as u32,
             self.config.tokens.codec_think_eos as u32,
-            speaker_id as u32,
             self.config.tokens.codec_pad as u32,
             self.config.tokens.codec_bos as u32,
         ])?;
+        let mut codec = Vec::with_capacity(7 * self.hidden);
+        codec.extend_from_slice(&codec_prefix[..4 * self.hidden]);
+        codec.extend_from_slice(speaker_embedding);
+        codec.extend_from_slice(&codec_prefix[4 * self.hidden..]);
         let tts_pad = self.config.tokens.tts_pad as u32;
         let tts_bos = self.config.tokens.tts_bos as u32;
         let tts = self

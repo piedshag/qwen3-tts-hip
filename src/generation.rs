@@ -11,7 +11,7 @@ use crate::model::config::Qwen3TtsConfig;
 use crate::model::sampling::SamplingConfig;
 use crate::model::talker::HipTalker;
 use crate::model::text::{CustomVoiceInputs, CustomVoiceTextPrep};
-pub use crate::model::text::{Language, Speaker};
+pub use crate::model::text::{Language, Speaker, VoiceClonePrompt};
 
 pub const SAMPLE_RATE: u32 = 24_000;
 pub const DEFAULT_MAX_CACHE_STEPS: usize = 512;
@@ -242,25 +242,31 @@ impl HipTtsEngine {
         })
     }
 
+    pub fn generate_voice_clone(
+        &self,
+        text: &str,
+        prompt: &VoiceClonePrompt,
+        options: GenerateOptions,
+    ) -> Result<GeneratedSpeech> {
+        let codes = self.generate_voice_clone_codes(text, prompt, options.clone())?;
+        let samples = if options.decode_audio && !codes.codes.is_empty() {
+            self.decode_codes(&codes.codes)?
+        } else {
+            Vec::new()
+        };
+        Ok(GeneratedSpeech {
+            text: text.to_string(),
+            frames: codes.frames,
+            ended_by_eos: codes.ended_by_eos,
+            codes: codes.codes,
+            samples,
+            sample_rate: SAMPLE_RATE,
+        })
+    }
+
     pub fn generate_codes(&self, text: &str, options: GenerateOptions) -> Result<GeneratedCodes> {
         let _range = profile::range("engine.generate_codes");
-        if options.max_frames == 0 {
-            return Err(Error::InvalidInput(
-                "max_frames must be non-zero".to_string(),
-            ));
-        }
-        if options.repetition_penalty <= 0.0 {
-            return Err(Error::InvalidInput(
-                "repetition_penalty must be positive".to_string(),
-            ));
-        }
-        if options.text_lookahead_tokens == 0 {
-            return Err(Error::InvalidInput(
-                "text_lookahead_tokens must be non-zero".to_string(),
-            ));
-        }
-        options.talker_sampling().validate("talker")?;
-        options.subtalker_sampling().validate("subtalker")?;
+        Self::validate_generate_options(&options)?;
         let inputs = {
             let _range = profile::range("engine.prepare_text");
             self.prep.prepare_custom_voice_with_lookahead(
@@ -270,13 +276,29 @@ impl HipTtsEngine {
                 options.text_lookahead_tokens,
             )?
         };
-        if inputs.prefill_steps + options.max_frames > self.max_cache_steps {
-            return Err(Error::InvalidInput(format!(
-                "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
-                inputs.prefill_steps + options.max_frames,
-                self.max_cache_steps
-            )));
-        }
+        self.check_cache_capacity(&inputs, options.max_frames)?;
+        let codes = self.rollout(&inputs, &options)?;
+        Ok(codes)
+    }
+
+    pub fn generate_voice_clone_codes(
+        &self,
+        text: &str,
+        prompt: &VoiceClonePrompt,
+        options: GenerateOptions,
+    ) -> Result<GeneratedCodes> {
+        let _range = profile::range("engine.generate_voice_clone_codes");
+        Self::validate_generate_options(&options)?;
+        let inputs = {
+            let _range = profile::range("engine.prepare_voice_clone_text");
+            self.prep.prepare_voice_clone_xvector_with_lookahead(
+                text,
+                prompt,
+                options.language,
+                options.text_lookahead_tokens,
+            )?
+        };
+        self.check_cache_capacity(&inputs, options.max_frames)?;
         let codes = self.rollout(&inputs, &options)?;
         Ok(codes)
     }
@@ -287,23 +309,7 @@ impl HipTtsEngine {
         options: GenerateOptions,
     ) -> Result<ProfiledGeneratedCodes> {
         let _range = profile::range("engine.generate_codes_profiled");
-        if options.max_frames == 0 {
-            return Err(Error::InvalidInput(
-                "max_frames must be non-zero".to_string(),
-            ));
-        }
-        if options.repetition_penalty <= 0.0 {
-            return Err(Error::InvalidInput(
-                "repetition_penalty must be positive".to_string(),
-            ));
-        }
-        if options.text_lookahead_tokens == 0 {
-            return Err(Error::InvalidInput(
-                "text_lookahead_tokens must be non-zero".to_string(),
-            ));
-        }
-        options.talker_sampling().validate("talker")?;
-        options.subtalker_sampling().validate("subtalker")?;
+        Self::validate_generate_options(&options)?;
 
         let mut timings = GenerationProfile::default();
         let start = Instant::now();
@@ -314,13 +320,7 @@ impl HipTtsEngine {
             options.text_lookahead_tokens,
         )?;
         timings.prepare_text_seconds = start.elapsed().as_secs_f64();
-        if inputs.prefill_steps + options.max_frames > self.max_cache_steps {
-            return Err(Error::InvalidInput(format!(
-                "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
-                inputs.prefill_steps + options.max_frames,
-                self.max_cache_steps
-            )));
-        }
+        self.check_cache_capacity(&inputs, options.max_frames)?;
 
         let codes = self.rollout_profiled(&inputs, &options, &mut timings)?;
         Ok(ProfiledGeneratedCodes {
@@ -331,23 +331,7 @@ impl HipTtsEngine {
 
     pub fn start_stream(&self, text: &str, options: GenerateOptions) -> Result<HipTtsStream<'_>> {
         let _range = profile::range("engine.start_stream");
-        if options.max_frames == 0 {
-            return Err(Error::InvalidInput(
-                "max_frames must be non-zero".to_string(),
-            ));
-        }
-        if options.repetition_penalty <= 0.0 {
-            return Err(Error::InvalidInput(
-                "repetition_penalty must be positive".to_string(),
-            ));
-        }
-        if options.text_lookahead_tokens == 0 {
-            return Err(Error::InvalidInput(
-                "text_lookahead_tokens must be non-zero".to_string(),
-            ));
-        }
-        options.talker_sampling().validate("talker")?;
-        options.subtalker_sampling().validate("subtalker")?;
+        Self::validate_generate_options(&options)?;
         let inputs = {
             let _range = profile::range("engine.prepare_text");
             self.prep.prepare_custom_voice_with_lookahead(
@@ -357,14 +341,36 @@ impl HipTtsEngine {
                 options.text_lookahead_tokens,
             )?
         };
-        if inputs.prefill_steps + options.max_frames > self.max_cache_steps {
-            return Err(Error::InvalidInput(format!(
-                "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
-                inputs.prefill_steps + options.max_frames,
-                self.max_cache_steps
-            )));
-        }
+        self.start_stream_with_inputs(text, inputs, options)
+    }
 
+    pub fn start_voice_clone_stream(
+        &self,
+        text: &str,
+        prompt: &VoiceClonePrompt,
+        options: GenerateOptions,
+    ) -> Result<HipTtsStream<'_>> {
+        let _range = profile::range("engine.start_voice_clone_stream");
+        Self::validate_generate_options(&options)?;
+        let inputs = {
+            let _range = profile::range("engine.prepare_voice_clone_text");
+            self.prep.prepare_voice_clone_xvector_with_lookahead(
+                text,
+                prompt,
+                options.language,
+                options.text_lookahead_tokens,
+            )?
+        };
+        self.start_stream_with_inputs(text, inputs, options)
+    }
+
+    fn start_stream_with_inputs(
+        &self,
+        text: &str,
+        inputs: CustomVoiceInputs,
+        options: GenerateOptions,
+    ) -> Result<HipTtsStream<'_>> {
+        self.check_cache_capacity(&inputs, options.max_frames)?;
         let talker_sampling = options.talker_sampling();
         let subtalker_sampling = options.subtalker_sampling();
         let mut rng_state = options.seed ^ 0x9e37_79b9_7f4a_7c15;
@@ -410,6 +416,38 @@ impl HipTtsEngine {
             frame: 0,
             ended_by_eos: false,
         })
+    }
+
+    fn validate_generate_options(options: &GenerateOptions) -> Result<()> {
+        if options.max_frames == 0 {
+            return Err(Error::InvalidInput(
+                "max_frames must be non-zero".to_string(),
+            ));
+        }
+        if options.repetition_penalty <= 0.0 {
+            return Err(Error::InvalidInput(
+                "repetition_penalty must be positive".to_string(),
+            ));
+        }
+        if options.text_lookahead_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "text_lookahead_tokens must be non-zero".to_string(),
+            ));
+        }
+        options.talker_sampling().validate("talker")?;
+        options.subtalker_sampling().validate("subtalker")?;
+        Ok(())
+    }
+
+    fn check_cache_capacity(&self, inputs: &CustomVoiceInputs, max_frames: usize) -> Result<()> {
+        if inputs.prefill_steps + max_frames > self.max_cache_steps {
+            return Err(Error::InvalidInput(format!(
+                "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
+                inputs.prefill_steps + max_frames,
+                self.max_cache_steps
+            )));
+        }
+        Ok(())
     }
 
     pub fn decode_codes(&self, codes: &[i32]) -> Result<Vec<f32>> {

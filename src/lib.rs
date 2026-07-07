@@ -78,7 +78,7 @@ pub use error::{Error, Result};
 pub use generation::{
     EngineOptions, GenerateOptions, GeneratedAudioChunk, GeneratedCodes, GeneratedCodesChunk,
     GeneratedSpeech, GenerationProfile, HipTtsEngine, HipTtsStream, Language,
-    ProfiledGeneratedCodes, Speaker,
+    ProfiledGeneratedCodes, Speaker, VoiceClonePrompt,
 };
 pub use graph::{HipGraph, HipGraphExec, HipStream};
 pub use kernel::{HipFunction, HipModule};
