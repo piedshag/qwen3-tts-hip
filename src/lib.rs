@@ -82,7 +82,7 @@ pub use error::{Error, Result};
 pub use generation::{
     EngineOptions, GenerateOptions, GeneratedAudioChunk, GeneratedCodes, GeneratedCodesChunk,
     GeneratedSpeech, GenerationProfile, HipTextStream, HipTtsEngine, HipTtsStream,
-    IncrementalAudio, Language, ProfiledGeneratedCodes, Speaker, TextStreamOptions,
+    IncrementalAudio, Language, ProfiledGeneratedCodes, Speaker, StreamOptions, TextStreamOptions,
     VoiceClonePrompt,
 };
 pub use graph::{HipGraph, HipGraphExec, HipStream};

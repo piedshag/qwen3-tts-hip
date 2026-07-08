@@ -4,10 +4,12 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use qwen3_hip_runtime::generation::{DEFAULT_TEXT_LOOKAHEAD_TOKENS, SAMPLE_RATE};
+use qwen3_hip_runtime::generation::{
+    DEFAULT_STREAM_LEFT_CONTEXT_FRAMES, DEFAULT_TEXT_LOOKAHEAD_TOKENS, SAMPLE_RATE,
+};
 use qwen3_hip_runtime::{
     Error, GenerateOptions, GeneratedSpeech, HipTtsEngine, Language, Result, Speaker,
-    VoiceClonePrompt,
+    StreamOptions, VoiceClonePrompt,
 };
 
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
@@ -32,6 +34,7 @@ struct Request {
 struct GenerationRequest {
     text: String,
     options: GenerateOptions,
+    stream_options: StreamOptions,
     wav_gain: f32,
     stream_chunk_frames: usize,
     use_voice_clone: bool,
@@ -223,10 +226,6 @@ fn handle_generate(state: &ServerState, stream: &mut TcpStream, request: &Reques
             format_seconds(options.subtalker_temperature as f64),
         ),
         ("X-TTS-Seed", options.seed.to_string()),
-        (
-            "X-TTS-Text-Lookahead-Tokens",
-            options.text_lookahead_tokens.to_string(),
-        ),
     ];
     send_response(stream, 200, "OK", &headers, &wav)
 }
@@ -254,13 +253,18 @@ fn handle_stream(state: &ServerState, stream: &mut TcpStream, request: &Request)
         let prompt = state.voice_clone_prompt.as_ref().ok_or_else(|| {
             Error::InvalidInput("server was not started with a voice clone prompt".to_string())
         })?;
-        state
-            .engine
-            .start_voice_clone_stream(&request.text, prompt, request.options.clone())?
+        state.engine.start_voice_clone_stream(
+            &request.text,
+            prompt,
+            request.options.clone(),
+            request.stream_options.clone(),
+        )?
     } else {
-        state
-            .engine
-            .start_stream(&request.text, request.options.clone())?
+        state.engine.start_stream(
+            &request.text,
+            request.options.clone(),
+            request.stream_options.clone(),
+        )?
     };
     send_chunked_headers(
         stream,
@@ -277,7 +281,11 @@ fn handle_stream(state: &ServerState, stream: &mut TcpStream, request: &Request)
             ),
             (
                 "X-TTS-Text-Lookahead-Tokens",
-                request.options.text_lookahead_tokens.to_string(),
+                request.stream_options.text_lookahead_tokens.to_string(),
+            ),
+            (
+                "X-TTS-Left-Context-Frames",
+                request.stream_options.left_context_frames.to_string(),
             ),
             ("X-TTS-Voice-Clone", request.use_voice_clone.to_string()),
         ],
@@ -424,6 +432,11 @@ fn parse_generation_request(state: &ServerState, request: &Request) -> Result<Ge
             "stream_chunk_frames must be non-zero".to_string(),
         ));
     }
+    let left_context_frames = form
+        .get("left_context_frames")
+        .map(|value| parse_usize(value, "left_context_frames"))
+        .transpose()?
+        .unwrap_or(DEFAULT_STREAM_LEFT_CONTEXT_FRAMES);
     let use_voice_clone = form
         .get("use_voice_clone")
         .map(|value| parse_bool(value, "use_voice_clone"))
@@ -453,7 +466,11 @@ fn parse_generation_request(state: &ServerState, request: &Request) -> Result<Ge
             subtalker_top_p,
             subtalker_temperature,
             seed,
+        },
+        stream_options: StreamOptions {
             text_lookahead_tokens,
+            left_context_frames,
+            ..StreamOptions::default()
         },
         wav_gain,
         stream_chunk_frames,
@@ -651,6 +668,9 @@ fn index_html(state: &ServerState) -> String {
     textarea {{ min-height: 110px; resize: vertical; }}
     .row {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }}
     .wide {{ grid-column: 1 / -1; }}
+    .section {{ display: grid; gap: 12px; padding-top: 12px; border-top: 1px solid #2d3240; }}
+    .actions {{ display: grid; gap: 12px; }}
+    .hidden {{ display: none !important; }}
     button {{ cursor: pointer; border: 0; background: linear-gradient(135deg, #f6c177, #eb6f92); color: #16120d; font-weight: 800; }}
     button:disabled {{ cursor: wait; filter: grayscale(0.7); opacity: 0.75; }}
     audio {{ width: 100%; margin: 8px 0 18px; }}
@@ -675,10 +695,16 @@ fn index_html(state: &ServerState) -> String {
       <textarea name="text">She said she would be here by noon.</textarea>
     </label>
     <div class="row">
+      <label>Output mode
+        <select name="output_mode" id="output-mode">
+          <option value="wav">Generate WAV</option>
+          <option value="stream">Stream PCM</option>
+        </select>
+      </label>
       <label>Frames
         <input name="max_frames" type="number" min="1" max="{max_cache_frames}" value="120">
       </label>
-      <label>Speaker
+      <label id="speaker-field">Speaker
         <select name="speaker">
           <option>Ryan</option><option>Serena</option><option>Vivian</option><option>UncleFu</option><option>Aiden</option><option>OnoAnna</option><option>Sohee</option><option>Eric</option><option>Dylan</option>
         </select>
@@ -694,11 +720,11 @@ fn index_html(state: &ServerState) -> String {
           <option>English</option><option>Chinese</option><option>Japanese</option><option>Korean</option><option>German</option><option>French</option><option>Russian</option><option>Portuguese</option><option>Spanish</option><option>Italian</option>
         </select>
       </label>
-      <label>WAV gain
-        <input name="wav_gain" type="number" step="0.1" value="1.0">
-      </label>
       <label>Repeat penalty
         <input name="repetition_penalty" type="number" step="0.01" min="0.01" value="1.05">
+      </label>
+      <label>Output gain
+        <input name="wav_gain" type="number" step="0.1" value="1.0">
       </label>
     </div>
     <div class="row">
@@ -717,12 +743,6 @@ fn index_html(state: &ServerState) -> String {
       <label>Seed
         <input name="seed" type="number" min="0" value="0">
       </label>
-      <label>Text lookahead
-        <input name="text_lookahead_tokens" type="number" min="1" value="{default_text_lookahead_tokens}">
-      </label>
-      <label>Stream chunk frames
-        <input name="stream_chunk_frames" type="number" min="1" value="{default_stream_chunk_frames}">
-      </label>
       <label>Sample acoustic
         <select name="subtalker_dosample"><option value="true">true</option><option value="false">false</option></select>
       </label>
@@ -735,10 +755,28 @@ fn index_html(state: &ServerState) -> String {
       <label>Acoustic Temp
         <input name="subtalker_temperature" type="number" step="0.01" min="0.01" value="0.9">
       </label>
-      <p class="wide">Defaults match Qwen TTS generation settings while keeping the streaming runtime path.</p>
+      <p class="wide">Defaults match Qwen TTS generation settings.</p>
     </div>
-    <button id="submit" type="submit">Generate WAV</button>
-    <button id="stream" type="button">Stream PCM</button>
+    <div class="section" id="wav-options">
+      <p class="wide">Full generation uses all text context for best one-shot quality.</p>
+    </div>
+    <div class="section hidden" id="stream-options">
+      <div class="row">
+        <label>Stream chunk frames
+          <input name="stream_chunk_frames" type="number" min="1" value="{default_stream_chunk_frames}">
+        </label>
+        <label>Text lookahead
+          <input name="text_lookahead_tokens" type="number" min="1" value="{default_text_lookahead_tokens}">
+        </label>
+        <label>Left context frames
+          <input name="left_context_frames" type="number" min="0" value="{default_left_context_frames}">
+        </label>
+      </div>
+      <p class="wide">Streaming options trade time-to-first-audio against chunk overhead and initial context.</p>
+    </div>
+    <div class="actions">
+      <button id="submit" type="submit">Generate WAV</button>
+    </div>
   </form>
   <audio id="audio" controls></audio>
   <pre id="stats">No generation yet.</pre>
@@ -746,11 +784,30 @@ fn index_html(state: &ServerState) -> String {
 <script>
 const form = document.getElementById('tts-form');
 const button = document.getElementById('submit');
-const streamButton = document.getElementById('stream');
 const audio = document.getElementById('audio');
 const stats = document.getElementById('stats');
+const speakerField = document.getElementById('speaker-field');
+const voiceMode = form.elements.use_voice_clone;
+const actionMode = form.elements.output_mode;
+const wavOptions = document.getElementById('wav-options');
+const streamOptions = document.getElementById('stream-options');
 const sampleRate = {sample_rate};
 let currentUrl = null;
+
+function setActionMode(mode) {{
+  wavOptions.classList.toggle('hidden', mode !== 'wav');
+  streamOptions.classList.toggle('hidden', mode !== 'stream');
+  button.textContent = mode === 'stream' ? 'Stream PCM' : 'Generate WAV';
+}}
+
+function updateVoiceMode() {{
+  speakerField.classList.toggle('hidden', voiceMode.value === 'true');
+}}
+
+voiceMode.addEventListener('change', updateVoiceMode);
+actionMode.addEventListener('change', () => setActionMode(actionMode.value));
+updateVoiceMode();
+setActionMode(actionMode.value);
 
 const statHeaders = [
   ['load_seconds', 'x-tts-load-seconds'],
@@ -778,12 +835,11 @@ const statHeaders = [
   ['subtalker_temperature', 'x-tts-subtalker-temperature'],
   ['seed', 'x-tts-seed'],
   ['text_lookahead_tokens', 'x-tts-text-lookahead-tokens'],
+  ['left_context_frames', 'x-tts-left-context-frames'],
 ];
 
-form.addEventListener('submit', async (event) => {{
-  event.preventDefault();
+async function generateWav() {{
   button.disabled = true;
-  streamButton.disabled = true;
   stats.textContent = 'Generating...';
   try {{
     const requestStart = performance.now();
@@ -808,13 +864,11 @@ form.addEventListener('submit', async (event) => {{
     stats.textContent = String(error.message || error);
   }} finally {{
     button.disabled = false;
-    streamButton.disabled = false;
   }}
-}});
+}}
 
-streamButton.addEventListener('click', async () => {{
+async function streamPcm() {{
   button.disabled = true;
-  streamButton.disabled = true;
   stats.textContent = 'Starting stream...';
   try {{
     const requestStart = performance.now();
@@ -883,7 +937,15 @@ streamButton.addEventListener('click', async () => {{
     stats.textContent = String(error.message || error);
   }} finally {{
     button.disabled = false;
-    streamButton.disabled = false;
+  }}
+}}
+
+form.addEventListener('submit', async (event) => {{
+  event.preventDefault();
+  if (actionMode.value === 'stream') {{
+    await streamPcm();
+  }} else {{
+    await generateWav();
   }}
 }});
 </script>
@@ -895,6 +957,7 @@ streamButton.addEventListener('click', async () => {{
         sample_rate = SAMPLE_RATE,
         default_stream_chunk_frames = DEFAULT_STREAM_CHUNK_FRAMES,
         default_text_lookahead_tokens = DEFAULT_TEXT_LOOKAHEAD_TOKENS,
+        default_left_context_frames = DEFAULT_STREAM_LEFT_CONTEXT_FRAMES,
         voice_clone_prompt_status = if state.voice_clone_prompt.is_some() {
             "loaded"
         } else {

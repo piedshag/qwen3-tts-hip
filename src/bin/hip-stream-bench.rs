@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use qwen3_hip_runtime::generation::DEFAULT_STREAM_LEFT_CONTEXT_FRAMES;
-use qwen3_hip_runtime::{Error, GenerateOptions, HipTtsEngine, Language, Result, Speaker};
+use qwen3_hip_runtime::{
+    Error, GenerateOptions, HipTtsEngine, Language, Result, Speaker, StreamOptions,
+};
 
 fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
@@ -43,7 +45,8 @@ fn main() -> Result<()> {
         decode_audio: false,
         ..GenerateOptions::default()
     };
-    let mut stream = engine.start_stream(&text, options)?;
+    let stream_options = StreamOptions::default();
+    let mut stream = engine.start_stream(&text, options, stream_options.clone())?;
     println!(
         "HIP stream bench: load_seconds={load_seconds:.6}, max_frames={max_frames}, chunk_frames={chunk_frames}, left_context_frames={DEFAULT_STREAM_LEFT_CONTEXT_FRAMES}"
     );
@@ -77,6 +80,7 @@ fn main() -> Result<()> {
             decode_audio: false,
             ..GenerateOptions::default()
         },
+        stream_options,
     )?;
     println!("HIP stream code chunk timings:");
     chunk_index = 0;

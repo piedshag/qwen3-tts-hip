@@ -66,7 +66,6 @@ fn main() -> qwen3_hip_runtime::Result<()> {
             subtalker_top_p: 1.0,
             subtalker_temperature: 0.9,
             seed: 0,
-            text_lookahead_tokens: 8,
         },
     )?;
 
@@ -81,9 +80,12 @@ use `HipTtsEngine::load_with_options(...)` and set `EngineOptions::max_cache_ste
 Useful generation options:
 
 - `max_frames`: maximum generated acoustic frames; each frame is 1,920 samples, or 80 ms at 24 kHz.
-- `text_lookahead_tokens`: number of initial text tokens to include in the streaming prefill. The default is `8`; use `1` for the lowest-latency streaming-style path or larger values for more initial text context.
 - `do_sample`, `top_k`, `top_p`, `temperature`, `repetition_penalty`: semantic token sampling controls.
 - `subtalker_dosample`, `subtalker_top_k`, `subtalker_top_p`, `subtalker_temperature`: acoustic CodePredictor sampling controls.
+
+Streaming-specific options live in `StreamOptions`, including
+`text_lookahead_tokens` for the fixed-text streaming prefill and
+`left_context_frames` for audio chunk decoding context.
 
 Base-model voice cloning currently supports precomputed x-vector-only prompt JSON
 artifacts. Export one with the Python reference helper, then load it with
@@ -124,11 +126,15 @@ and PCM streaming.
 For incremental generation, create a persistent stream and pull code or audio chunks:
 
 ```rust,no_run
-use qwen3_hip_runtime::{GenerateOptions, HipTtsEngine};
+use qwen3_hip_runtime::{GenerateOptions, HipTtsEngine, StreamOptions};
 
 fn main() -> qwen3_hip_runtime::Result<()> {
     let engine = HipTtsEngine::load_with_max_frames("/path/to/model", 0, 240)?;
-    let mut stream = engine.start_stream("She said she would be here by noon.", GenerateOptions::default())?;
+    let mut stream = engine.start_stream(
+        "She said she would be here by noon.",
+        GenerateOptions::default(),
+        StreamOptions::default(),
+    )?;
 
     while let Some(chunk) = stream.next_audio_chunk(6)? {
         println!("streamed {} new samples", chunk.samples.len());

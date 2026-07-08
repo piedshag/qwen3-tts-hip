@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use qwen3_hip_runtime::codec::write_wav;
 use qwen3_hip_runtime::generation::{
-    DEFAULT_TEXT_LOOKAHEAD_TOKENS, GenerateOptions, HipTtsEngine, Language, Speaker,
+    DEFAULT_TEXT_LOOKAHEAD_TOKENS, GenerateOptions, HipTtsEngine, Language, Speaker, StreamOptions,
     VoiceClonePrompt,
 };
 use qwen3_hip_runtime::{Error, Result};
@@ -93,13 +93,24 @@ fn main() -> Result<()> {
         subtalker_top_p,
         subtalker_temperature,
         seed,
+    };
+    let stream_options = StreamOptions {
         text_lookahead_tokens,
+        ..StreamOptions::default()
     };
     let voice_clone_prompt = voice_clone_prompt_path
         .as_deref()
         .map(VoiceClonePrompt::from_json)
         .transpose()?;
-    let generated = if let Some(prompt) = voice_clone_prompt.as_ref() {
+    let generated = if reference_codes.is_some() {
+        if let Some(prompt) = voice_clone_prompt.as_ref() {
+            let stream = engine.start_voice_clone_stream(&text, prompt, options, stream_options)?;
+            finish_stream_codes(stream, max_frames)?
+        } else {
+            let stream = engine.start_stream(&text, options, stream_options)?;
+            finish_stream_codes(stream, max_frames)?
+        }
+    } else if let Some(prompt) = voice_clone_prompt.as_ref() {
         engine.generate_voice_clone_codes(&text, prompt, options)?
     } else {
         engine.generate_codes(&text, options)?
@@ -169,6 +180,14 @@ fn main() -> Result<()> {
         &generated.codes[generated.codes.len().saturating_sub(CODE_GROUPS)..]
     );
     Ok(())
+}
+
+fn finish_stream_codes(
+    mut stream: qwen3_hip_runtime::HipTtsStream<'_>,
+    max_frames: usize,
+) -> Result<qwen3_hip_runtime::GeneratedCodes> {
+    while stream.next_codes_chunk(max_frames)?.is_some() {}
+    Ok(stream.finish_codes())
 }
 
 fn format_optional_seconds(value: Option<f64>) -> String {

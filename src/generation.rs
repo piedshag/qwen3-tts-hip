@@ -52,7 +52,6 @@ pub struct GenerateOptions {
     pub subtalker_top_p: f32,
     pub subtalker_temperature: f32,
     pub seed: u64,
-    pub text_lookahead_tokens: usize,
 }
 
 impl Default for GenerateOptions {
@@ -72,7 +71,21 @@ impl Default for GenerateOptions {
             subtalker_top_p: 1.0,
             subtalker_temperature: 0.9,
             seed: 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StreamOptions {
+    pub text_lookahead_tokens: usize,
+    pub left_context_frames: usize,
+}
+
+impl Default for StreamOptions {
+    fn default() -> Self {
+        Self {
             text_lookahead_tokens: DEFAULT_TEXT_LOOKAHEAD_TOKENS,
+            left_context_frames: DEFAULT_STREAM_LEFT_CONTEXT_FRAMES,
         }
     }
 }
@@ -137,6 +150,7 @@ pub struct HipTtsStream<'a> {
     subtalker_sampling: SamplingConfig,
     repetition_penalty: f32,
     rng_state: u64,
+    left_context_frames: usize,
     trailing: Vec<DeviceBuffer<f32>>,
     cp_prefix: DeviceBuffer<f32>,
     acoustic_sum: DeviceBuffer<f32>,
@@ -182,6 +196,7 @@ pub struct TextStreamOptions {
     pub min_start_tokens: usize,
     pub min_resume_tokens: usize,
     pub flush_on_punctuation: bool,
+    pub left_context_frames: usize,
 }
 
 impl Default for TextStreamOptions {
@@ -190,6 +205,7 @@ impl Default for TextStreamOptions {
             min_start_tokens: DEFAULT_TEXT_LOOKAHEAD_TOKENS,
             min_resume_tokens: 1,
             flush_on_punctuation: true,
+            left_context_frames: DEFAULT_STREAM_LEFT_CONTEXT_FRAMES,
         }
     }
 }
@@ -329,7 +345,7 @@ impl HipTtsEngine {
                 text,
                 options.speaker,
                 options.language,
-                options.text_lookahead_tokens,
+                usize::MAX,
             )?
         };
         self.check_cache_capacity(&inputs, options.max_frames)?;
@@ -351,7 +367,7 @@ impl HipTtsEngine {
                 text,
                 prompt,
                 options.language,
-                options.text_lookahead_tokens,
+                usize::MAX,
             )?
         };
         self.check_cache_capacity(&inputs, options.max_frames)?;
@@ -373,7 +389,7 @@ impl HipTtsEngine {
             text,
             options.speaker,
             options.language,
-            options.text_lookahead_tokens,
+            usize::MAX,
         )?;
         timings.prepare_text_seconds = start.elapsed().as_secs_f64();
         self.check_cache_capacity(&inputs, options.max_frames)?;
@@ -385,19 +401,25 @@ impl HipTtsEngine {
         })
     }
 
-    pub fn start_stream(&self, text: &str, options: GenerateOptions) -> Result<HipTtsStream<'_>> {
+    pub fn start_stream(
+        &self,
+        text: &str,
+        options: GenerateOptions,
+        stream_options: StreamOptions,
+    ) -> Result<HipTtsStream<'_>> {
         let _range = profile::range("engine.start_stream");
         Self::validate_generate_options(&options)?;
+        Self::validate_stream_options(&stream_options)?;
         let inputs = {
             let _range = profile::range("engine.prepare_text");
             self.prep.prepare_custom_voice_with_lookahead(
                 text,
                 options.speaker,
                 options.language,
-                options.text_lookahead_tokens,
+                stream_options.text_lookahead_tokens,
             )?
         };
-        self.start_stream_with_inputs(text, inputs, options)
+        self.start_stream_with_inputs(text, inputs, options, stream_options)
     }
 
     pub fn start_voice_clone_stream(
@@ -405,19 +427,21 @@ impl HipTtsEngine {
         text: &str,
         prompt: &VoiceClonePrompt,
         options: GenerateOptions,
+        stream_options: StreamOptions,
     ) -> Result<HipTtsStream<'_>> {
         let _range = profile::range("engine.start_voice_clone_stream");
         Self::validate_generate_options(&options)?;
+        Self::validate_stream_options(&stream_options)?;
         let inputs = {
             let _range = profile::range("engine.prepare_voice_clone_text");
             self.prep.prepare_voice_clone_xvector_with_lookahead(
                 text,
                 prompt,
                 options.language,
-                options.text_lookahead_tokens,
+                stream_options.text_lookahead_tokens,
             )?
         };
-        self.start_stream_with_inputs(text, inputs, options)
+        self.start_stream_with_inputs(text, inputs, options, stream_options)
     }
 
     pub fn start_text_stream(
@@ -453,6 +477,7 @@ impl HipTtsEngine {
         text: &str,
         inputs: TtsPreparedInputs,
         options: GenerateOptions,
+        stream_options: StreamOptions,
     ) -> Result<HipTtsStream<'_>> {
         self.check_cache_capacity(&inputs, options.max_frames)?;
         let talker_sampling = options.talker_sampling();
@@ -491,6 +516,7 @@ impl HipTtsEngine {
             subtalker_sampling,
             repetition_penalty: options.repetition_penalty,
             rng_state,
+            left_context_frames: stream_options.left_context_frames,
             trailing,
             cp_prefix: self.runtime.empty_buffer::<f32>(2 * hidden)?,
             acoustic_sum: self.runtime.empty_buffer::<f32>(hidden)?,
@@ -513,13 +539,17 @@ impl HipTtsEngine {
                 "repetition_penalty must be positive".to_string(),
             ));
         }
+        options.talker_sampling().validate("talker")?;
+        options.subtalker_sampling().validate("subtalker")?;
+        Ok(())
+    }
+
+    fn validate_stream_options(options: &StreamOptions) -> Result<()> {
         if options.text_lookahead_tokens == 0 {
             return Err(Error::InvalidInput(
                 "text_lookahead_tokens must be non-zero".to_string(),
             ));
         }
-        options.talker_sampling().validate("talker")?;
-        options.subtalker_sampling().validate("subtalker")?;
         Ok(())
     }
 
@@ -902,7 +932,7 @@ impl HipTtsStream<'_> {
             return Ok(None);
         };
         let start_frame = codes.total_frames - codes.frames;
-        let context_frames = DEFAULT_STREAM_LEFT_CONTEXT_FRAMES.min(start_frame);
+        let context_frames = self.left_context_frames.min(start_frame);
         let decode_start_frame = start_frame - context_frames;
         let decode_start = decode_start_frame * self.engine.code_groups;
         let decode_end = codes.total_frames * self.engine.code_groups;
@@ -1012,7 +1042,7 @@ impl<'a> HipTextStream<'a> {
             return Ok(IncrementalAudio::Finished(codes));
         };
         let start_frame = codes.total_frames - codes.frames;
-        let context_frames = DEFAULT_STREAM_LEFT_CONTEXT_FRAMES.min(start_frame);
+        let context_frames = self.stream_options.left_context_frames.min(start_frame);
         let decode_start_frame = start_frame - context_frames;
         let decode_start = decode_start_frame * self.engine.code_groups;
         let decode_end = codes.total_frames * self.engine.code_groups;
@@ -1139,8 +1169,8 @@ impl<'a> HipTextStream<'a> {
         }
 
         let lookahead = self
-            .options
-            .text_lookahead_tokens
+            .stream_options
+            .min_start_tokens
             .min(self.queued_tokens.len())
             .max(1);
         let mut prefill_tokens = Vec::with_capacity(lookahead);
