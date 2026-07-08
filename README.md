@@ -138,6 +138,35 @@ fn main() -> qwen3_hip_runtime::Result<()> {
 }
 ```
 
+For incoming text from an LLM or another producer, use the incremental text stream.
+It returns `NeedMoreText` when generation should pause until more text arrives:
+
+```rust,no_run
+use qwen3_hip_runtime::{GenerateOptions, HipTtsEngine, IncrementalAudio, TextStreamOptions};
+
+fn main() -> qwen3_hip_runtime::Result<()> {
+    let engine = HipTtsEngine::load_with_max_frames("/path/to/model", 0, 240)?;
+    let mut stream = engine.start_text_stream(
+        GenerateOptions::default(),
+        TextStreamOptions::default(),
+    )?;
+
+    stream.push_text("The model begins speaking ")?;
+    stream.push_text("as text chunks arrive.")?;
+    stream.finish_text()?;
+
+    loop {
+        match stream.next_audio_chunk(12)? {
+            IncrementalAudio::Chunk(chunk) => println!("{} samples", chunk.samples.len()),
+            IncrementalAudio::NeedMoreText => break,
+            IncrementalAudio::Finished(_) => break,
+        }
+    }
+
+    Ok(())
+}
+```
+
 ## Python Parity Fixtures
 
 The parity workflow is self-contained in this repository. Generated fixture data

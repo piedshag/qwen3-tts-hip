@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -144,6 +145,60 @@ pub struct HipTtsStream<'a> {
     codes: Vec<i32>,
     frame: usize,
     ended_by_eos: bool,
+}
+
+pub struct HipTextStream<'a> {
+    engine: &'a HipTtsEngine,
+    options: GenerateOptions,
+    stream_options: TextStreamOptions,
+    voice_clone_prompt: Option<VoiceClonePrompt>,
+    pending_text: String,
+    queued_tokens: VecDeque<u32>,
+    text_finished: bool,
+    eos_pending: bool,
+    eos_consumed: bool,
+    state: Option<HipTextStreamState>,
+    finished_codes: Option<GeneratedCodes>,
+}
+
+struct HipTextStreamState {
+    prefill_steps: usize,
+    talker_sampling: SamplingConfig,
+    subtalker_sampling: SamplingConfig,
+    repetition_penalty: f32,
+    rng_state: u64,
+    tts_pad_embedding: Vec<f32>,
+    cp_prefix: DeviceBuffer<f32>,
+    acoustic_sum: DeviceBuffer<f32>,
+    semantic: i32,
+    semantic_history: Vec<i32>,
+    codes: Vec<i32>,
+    frame: usize,
+    ended_by_eos: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct TextStreamOptions {
+    pub min_start_tokens: usize,
+    pub min_resume_tokens: usize,
+    pub flush_on_punctuation: bool,
+}
+
+impl Default for TextStreamOptions {
+    fn default() -> Self {
+        Self {
+            min_start_tokens: DEFAULT_TEXT_LOOKAHEAD_TOKENS,
+            min_resume_tokens: 1,
+            flush_on_punctuation: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum IncrementalAudio {
+    Chunk(GeneratedAudioChunk),
+    NeedMoreText,
+    Finished(GeneratedCodes),
 }
 
 #[derive(Clone, Debug)]
@@ -365,6 +420,34 @@ impl HipTtsEngine {
         self.start_stream_with_inputs(text, inputs, options)
     }
 
+    pub fn start_text_stream(
+        &self,
+        options: GenerateOptions,
+        stream_options: TextStreamOptions,
+    ) -> Result<HipTextStream<'_>> {
+        let _range = profile::range("engine.start_text_stream");
+        Self::validate_generate_options(&options)?;
+        Self::validate_text_stream_options(&stream_options)?;
+        Ok(HipTextStream::new(self, options, stream_options, None))
+    }
+
+    pub fn start_voice_clone_text_stream(
+        &self,
+        prompt: &VoiceClonePrompt,
+        options: GenerateOptions,
+        stream_options: TextStreamOptions,
+    ) -> Result<HipTextStream<'_>> {
+        let _range = profile::range("engine.start_voice_clone_text_stream");
+        Self::validate_generate_options(&options)?;
+        Self::validate_text_stream_options(&stream_options)?;
+        Ok(HipTextStream::new(
+            self,
+            options,
+            stream_options,
+            Some(prompt.clone()),
+        ))
+    }
+
     fn start_stream_with_inputs(
         &self,
         text: &str,
@@ -437,6 +520,20 @@ impl HipTtsEngine {
         }
         options.talker_sampling().validate("talker")?;
         options.subtalker_sampling().validate("subtalker")?;
+        Ok(())
+    }
+
+    fn validate_text_stream_options(options: &TextStreamOptions) -> Result<()> {
+        if options.min_start_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "min_start_tokens must be non-zero".to_string(),
+            ));
+        }
+        if options.min_resume_tokens == 0 {
+            return Err(Error::InvalidInput(
+                "min_resume_tokens must be non-zero".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -834,6 +931,373 @@ impl HipTtsStream<'_> {
     pub fn text(&self) -> &str {
         &self.text
     }
+}
+
+impl<'a> HipTextStream<'a> {
+    fn new(
+        engine: &'a HipTtsEngine,
+        options: GenerateOptions,
+        stream_options: TextStreamOptions,
+        voice_clone_prompt: Option<VoiceClonePrompt>,
+    ) -> HipTextStream<'a> {
+        Self {
+            engine,
+            options,
+            stream_options,
+            voice_clone_prompt,
+            pending_text: String::new(),
+            queued_tokens: VecDeque::new(),
+            text_finished: false,
+            eos_pending: false,
+            eos_consumed: false,
+            state: None,
+            finished_codes: None,
+        }
+    }
+
+    pub fn push_text(&mut self, text: &str) -> Result<()> {
+        if self.text_finished {
+            return Err(Error::InvalidInput(
+                "cannot push text after finish_text".to_string(),
+            ));
+        }
+        self.pending_text.push_str(text);
+        self.flush_stable_text()
+    }
+
+    pub fn finish_text(&mut self) -> Result<()> {
+        if self.text_finished {
+            return Ok(());
+        }
+        if !self.pending_text.is_empty() {
+            let text = std::mem::take(&mut self.pending_text);
+            self.enqueue_text_tokens(&text)?;
+        }
+        self.text_finished = true;
+        self.eos_pending = true;
+        Ok(())
+    }
+
+    pub fn next_audio_chunk(&mut self, max_chunk_frames: usize) -> Result<IncrementalAudio> {
+        if max_chunk_frames == 0 {
+            return Err(Error::InvalidInput(
+                "max_chunk_frames must be non-zero".to_string(),
+            ));
+        }
+        if let Some(codes) = self.finished_codes.as_ref() {
+            return Ok(IncrementalAudio::Finished(codes.clone()));
+        }
+        if self.state.is_none() && !self.try_start_generation()? {
+            if self.text_finished && self.queued_tokens.is_empty() && self.eos_pending {
+                let codes = GeneratedCodes {
+                    codes: Vec::new(),
+                    frames: 0,
+                    ended_by_eos: false,
+                };
+                self.finished_codes = Some(codes.clone());
+                return Ok(IncrementalAudio::Finished(codes));
+            }
+            return Ok(IncrementalAudio::NeedMoreText);
+        }
+
+        let Some(codes) = self.next_codes_chunk(max_chunk_frames)? else {
+            if self.is_generation_finished() {
+                let codes = self.finish_codes();
+                return Ok(IncrementalAudio::Finished(codes));
+            }
+            return Ok(IncrementalAudio::NeedMoreText);
+        };
+        let Some(state) = self.state.as_ref() else {
+            let codes = self.finish_codes();
+            return Ok(IncrementalAudio::Finished(codes));
+        };
+        let start_frame = codes.total_frames - codes.frames;
+        let context_frames = DEFAULT_STREAM_LEFT_CONTEXT_FRAMES.min(start_frame);
+        let decode_start_frame = start_frame - context_frames;
+        let decode_start = decode_start_frame * self.engine.code_groups;
+        let decode_end = codes.total_frames * self.engine.code_groups;
+        let decoded = self
+            .engine
+            .decode_codes(&state.codes[decode_start..decode_end])?;
+        let context_samples = context_frames * self.engine.codec.samples_per_code_frame();
+        let samples = decoded[context_samples.min(decoded.len())..].to_vec();
+        Ok(IncrementalAudio::Chunk(GeneratedAudioChunk {
+            samples,
+            sample_rate: SAMPLE_RATE,
+            frames: codes.frames,
+            total_frames: codes.total_frames,
+            ended_by_eos: codes.ended_by_eos,
+        }))
+    }
+
+    fn next_codes_chunk(&mut self, max_chunk_frames: usize) -> Result<Option<GeneratedCodesChunk>> {
+        let Some(mut state) = self.state.take() else {
+            return Ok(None);
+        };
+        if state.ended_by_eos || state.frame >= self.options.max_frames {
+            self.state = Some(state);
+            return Ok(None);
+        }
+
+        let start = state.codes.len();
+        let mut produced = 0usize;
+        while produced < max_chunk_frames && state.frame < self.options.max_frames {
+            if state.semantic == self.engine.codec_eos_token {
+                state.ended_by_eos = true;
+                break;
+            }
+
+            let current_frame = state.frame;
+            let trailing = if current_frame + 1 < self.options.max_frames {
+                match self.next_trailing_buffer(&state.tts_pad_embedding)? {
+                    Some(trailing) => Some(trailing),
+                    None => break,
+                }
+            } else {
+                None
+            };
+
+            {
+                let _range = profile::range("engine.text_stream.prepare_code_predictor_prefix");
+                self.engine
+                    .talker
+                    .prepare_code_predictor_prefix(&state.cp_prefix)?;
+            }
+            let acoustic = {
+                let _range = profile::range("engine.text_stream.code_predictor");
+                self.engine.predictor.generate_to_buffer_with_options(
+                    &state.cp_prefix,
+                    &state.acoustic_sum,
+                    state.subtalker_sampling,
+                    &mut state.rng_state,
+                )?
+            };
+            state.codes.push(state.semantic);
+            state.codes.extend(acoustic);
+            state.semantic_history.push(state.semantic);
+            produced += 1;
+
+            if let Some(trailing) = trailing.as_ref() {
+                {
+                    let _range = profile::range("engine.text_stream.build_step_input");
+                    self.engine
+                        .talker
+                        .build_step_input(&state.acoustic_sum, trailing)?;
+                }
+                state.semantic = {
+                    let _range = profile::range("engine.text_stream.talker_decode");
+                    if state.repetition_penalty != 1.0 || state.talker_sampling.do_sample {
+                        let previous = self
+                            .engine
+                            .runtime
+                            .buffer_from_slice(&state.semantic_history)?;
+                        self.engine.talker.decode_prepared_token_with_options(
+                            state.prefill_steps + current_frame,
+                            &previous,
+                            state.repetition_penalty,
+                            state.talker_sampling,
+                            &mut state.rng_state,
+                        )?
+                    } else {
+                        self.engine
+                            .talker
+                            .decode_prepared_token(state.prefill_steps + current_frame)?
+                    }
+                };
+            }
+            state.frame += 1;
+        }
+        if state.frame < self.options.max_frames && state.semantic == self.engine.codec_eos_token {
+            state.ended_by_eos = true;
+        }
+        self.engine.runtime.synchronize()?;
+
+        if state.codes.len() == start {
+            self.state = Some(state);
+            return Ok(None);
+        }
+        let codes = state.codes[start..].to_vec();
+        let chunk = GeneratedCodesChunk {
+            frames: codes.len() / self.engine.code_groups,
+            codes,
+            total_frames: state.frame,
+            ended_by_eos: state.ended_by_eos,
+        };
+        self.state = Some(state);
+        Ok(Some(chunk))
+    }
+
+    fn try_start_generation(&mut self) -> Result<bool> {
+        if self.state.is_some() {
+            return Ok(true);
+        }
+        if self.queued_tokens.len() < self.stream_options.min_start_tokens && !self.text_finished {
+            return Ok(false);
+        }
+        if self.queued_tokens.is_empty() {
+            return Ok(false);
+        }
+
+        let lookahead = self
+            .options
+            .text_lookahead_tokens
+            .min(self.queued_tokens.len())
+            .max(1);
+        let mut prefill_tokens = Vec::with_capacity(lookahead);
+        for _ in 0..lookahead {
+            if let Some(token) = self.queued_tokens.pop_front() {
+                prefill_tokens.push(token);
+            }
+        }
+        let prefill = if let Some(prompt) = self.voice_clone_prompt.as_ref() {
+            self.engine
+                .prep
+                .voice_clone_xvector_prefill_from_content_tokens(
+                    &prefill_tokens,
+                    prompt,
+                    self.options.language,
+                )?
+        } else {
+            self.engine.prep.custom_voice_prefill_from_content_tokens(
+                &prefill_tokens,
+                self.options.speaker,
+                self.options.language,
+            )?
+        };
+        let prefill_steps = prefill.len() / self.engine.talker.hidden_size();
+        if prefill_steps + self.options.max_frames > self.engine.max_cache_steps {
+            return Err(Error::InvalidInput(format!(
+                "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
+                prefill_steps + self.options.max_frames,
+                self.engine.max_cache_steps
+            )));
+        }
+
+        let talker_sampling = self.options.talker_sampling();
+        let subtalker_sampling = self.options.subtalker_sampling();
+        let mut rng_state = self.options.seed ^ 0x9e37_79b9_7f4a_7c15;
+        let hidden = self.engine.talker.hidden_size();
+        let prefill = self.engine.runtime.buffer_from_slice(&prefill)?;
+        let tts_pad_embedding = self.engine.prep.tts_pad_embedding()?;
+        let semantic = if talker_sampling.do_sample {
+            self.engine.talker.prefill_token_with_sampling(
+                &prefill,
+                prefill_steps,
+                talker_sampling,
+                &mut rng_state,
+            )?
+        } else {
+            self.engine.talker.prefill_token(&prefill, prefill_steps)?
+        };
+        self.state = Some(HipTextStreamState {
+            prefill_steps,
+            talker_sampling,
+            subtalker_sampling,
+            repetition_penalty: self.options.repetition_penalty,
+            rng_state,
+            tts_pad_embedding,
+            cp_prefix: self.engine.runtime.empty_buffer::<f32>(2 * hidden)?,
+            acoustic_sum: self.engine.runtime.empty_buffer::<f32>(hidden)?,
+            semantic,
+            semantic_history: Vec::with_capacity(self.options.max_frames),
+            codes: Vec::with_capacity(self.options.max_frames * self.engine.code_groups),
+            frame: 0,
+            ended_by_eos: false,
+        });
+        Ok(true)
+    }
+
+    fn next_trailing_buffer(
+        &mut self,
+        tts_pad_embedding: &[f32],
+    ) -> Result<Option<DeviceBuffer<f32>>> {
+        if !self.text_finished && self.queued_tokens.len() < self.stream_options.min_resume_tokens {
+            return Ok(None);
+        }
+        if let Some(token) = self.queued_tokens.pop_front() {
+            let embedding = self.engine.prep.projected_text_embedding_for_token(token)?;
+            return self.engine.runtime.buffer_from_slice(&embedding).map(Some);
+        }
+        if self.eos_pending {
+            self.eos_pending = false;
+            self.eos_consumed = true;
+            let embedding = self
+                .engine
+                .prep
+                .projected_text_embedding_for_token(self.engine.prep.tts_eos_token())?;
+            return self.engine.runtime.buffer_from_slice(&embedding).map(Some);
+        }
+        if self.text_finished || self.eos_consumed {
+            return self
+                .engine
+                .runtime
+                .buffer_from_slice(tts_pad_embedding)
+                .map(Some);
+        }
+        Ok(None)
+    }
+
+    fn flush_stable_text(&mut self) -> Result<()> {
+        let Some(split) =
+            stable_prefix_len(&self.pending_text, self.stream_options.flush_on_punctuation)
+        else {
+            return Ok(());
+        };
+        if split == 0 {
+            return Ok(());
+        }
+        let suffix = self.pending_text.split_off(split);
+        let prefix = std::mem::replace(&mut self.pending_text, suffix);
+        self.enqueue_text_tokens(&prefix)
+    }
+
+    fn enqueue_text_tokens(&mut self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let tokens = self.engine.prep.content_ids_for_text(text)?;
+        self.queued_tokens.extend(tokens);
+        Ok(())
+    }
+
+    fn finish_codes(&mut self) -> GeneratedCodes {
+        let codes = if let Some(state) = self.state.as_ref() {
+            GeneratedCodes {
+                frames: state.codes.len() / self.engine.code_groups,
+                codes: state.codes.clone(),
+                ended_by_eos: state.ended_by_eos,
+            }
+        } else {
+            GeneratedCodes {
+                frames: 0,
+                codes: Vec::new(),
+                ended_by_eos: false,
+            }
+        };
+        self.finished_codes = Some(codes.clone());
+        codes
+    }
+
+    fn is_generation_finished(&self) -> bool {
+        self.state
+            .as_ref()
+            .map(|state| state.ended_by_eos || state.frame >= self.options.max_frames)
+            .unwrap_or(false)
+    }
+}
+
+fn stable_prefix_len(text: &str, flush_on_punctuation: bool) -> Option<usize> {
+    let mut split = None;
+    for (index, ch) in text.char_indices() {
+        if ch.is_whitespace() || (flush_on_punctuation && is_sentence_boundary(ch)) {
+            split = Some(index + ch.len_utf8());
+        }
+    }
+    split
+}
+
+fn is_sentence_boundary(ch: char) -> bool {
+    matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '\n')
 }
 
 impl GenerateOptions {

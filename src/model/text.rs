@@ -381,6 +381,54 @@ impl TtsTextPrep {
         })
     }
 
+    pub(crate) fn content_ids_for_text(&self, text: &str) -> Result<Vec<u32>> {
+        let assistant_text =
+            format!("<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n");
+        let input_ids = self.tokenizer.encode(&assistant_text)?;
+        if input_ids.len() < 8 {
+            return Err(Error::InvalidInput(format!(
+                "formatted prompt is too short: {} tokens",
+                input_ids.len()
+            )));
+        }
+        Ok(input_ids[3..input_ids.len() - 5].to_vec())
+    }
+
+    pub(crate) fn custom_voice_prefill_from_content_tokens(
+        &self,
+        content_tokens: &[u32],
+        speaker: Speaker,
+        language: Language,
+    ) -> Result<Vec<f32>> {
+        self.build_custom_voice_prefill(content_tokens, speaker, language)
+    }
+
+    pub(crate) fn voice_clone_xvector_prefill_from_content_tokens(
+        &self,
+        content_tokens: &[u32],
+        prompt: &VoiceClonePrompt,
+        language: Language,
+    ) -> Result<Vec<f32>> {
+        if !prompt.x_vector_only_mode || prompt.icl_mode || prompt.ref_codes.is_some() {
+            return Err(Error::InvalidInput(
+                "only x-vector-only voice clone prompts are supported for now".to_string(),
+            ));
+        }
+        self.build_voice_clone_xvector_prefill(content_tokens, &prompt.speaker_embedding, language)
+    }
+
+    pub(crate) fn projected_text_embedding_for_token(&self, token: u32) -> Result<Vec<f32>> {
+        self.projected_text_embeddings(&[token])
+    }
+
+    pub(crate) fn tts_eos_token(&self) -> u32 {
+        self.config.tokens.tts_eos as u32
+    }
+
+    pub(crate) fn tts_pad_embedding(&self) -> Result<Vec<f32>> {
+        self.projected_text_embeddings(&[self.config.tokens.tts_pad as u32])
+    }
+
     pub fn prepare_voice_clone_xvector_with_lookahead(
         &self,
         text: &str,
