@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qwen3_hip_runtime::text::{CustomVoiceTextPrep, Language, Speaker};
+use qwen3_hip_runtime::text::{Language, Speaker, TtsTextPrep};
 use qwen3_hip_runtime::{Error, Result};
 
 struct NpyF32 {
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
         .transpose()?
         .unwrap_or(Language::English);
 
-    let prep = CustomVoiceTextPrep::load(&model_dir)?;
+    let prep = TtsTextPrep::load(&model_dir)?;
     let inputs = prep.prepare_custom_voice(&text, speaker, language)?;
 
     compare_ids(

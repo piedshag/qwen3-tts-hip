@@ -48,7 +48,7 @@ cargo run --profile "$PROFILE" --bin code-predictor-parity -- \
   "$MODEL_DIR" \
   "$FIXTURE_ROOT/code_predictor_f32"
 
-cargo run --profile "$PROFILE" --bin hip-custom-voice-generate -- \
+cargo run --profile "$PROFILE" --bin hip-tts-generate -- \
   "$MODEL_DIR" \
   "$TEXT" \
   12 \
@@ -70,7 +70,7 @@ cargo run --profile "$PROFILE" --bin hip-custom-voice-generate -- \
   1
 
 if [[ "$MODE" == "full" ]]; then
-  cargo run --profile "$PROFILE" --bin hip-custom-voice-generate -- \
+  cargo run --profile "$PROFILE" --bin hip-tts-generate -- \
     "$MODEL_DIR" \
     "$TEXT" \
     39 \

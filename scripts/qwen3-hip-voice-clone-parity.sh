@@ -54,7 +54,7 @@ print(np.load(sys.argv[1]).shape[0])
 PY
 )"
 
-cargo run --profile "$PROFILE" --bin hip-custom-voice-generate -- \
+cargo run --profile "$PROFILE" --bin hip-tts-generate -- \
   "$MODEL_DIR" \
   "$TEXT" \
   "$FRAMES" \

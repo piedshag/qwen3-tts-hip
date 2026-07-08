@@ -5,4 +5,5 @@ pub(crate) mod sampling;
 pub mod stack;
 pub mod talker;
 pub mod text;
+pub mod voice_clone;
 pub mod weights;

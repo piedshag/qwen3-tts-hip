@@ -10,8 +10,9 @@ use crate::model::code_predictor::HipCodePredictor;
 use crate::model::config::Qwen3TtsConfig;
 use crate::model::sampling::SamplingConfig;
 use crate::model::talker::HipTalker;
-use crate::model::text::{CustomVoiceInputs, CustomVoiceTextPrep};
-pub use crate::model::text::{Language, Speaker, VoiceClonePrompt};
+pub use crate::model::text::{Language, Speaker};
+use crate::model::text::{TtsPreparedInputs, TtsTextPrep};
+pub use crate::model::voice_clone::VoiceClonePrompt;
 
 pub const SAMPLE_RATE: u32 = 24_000;
 pub const DEFAULT_MAX_CACHE_STEPS: usize = 512;
@@ -117,7 +118,7 @@ pub struct ProfiledGeneratedCodes {
 pub struct HipTtsEngine {
     runtime: HipRuntime,
     model_dir: PathBuf,
-    prep: CustomVoiceTextPrep,
+    prep: TtsTextPrep,
     talker: HipTalker,
     predictor: HipCodePredictor,
     codec: HipCodecInitial,
@@ -200,7 +201,7 @@ impl HipTtsEngine {
         }
         let model_dir = model_dir.as_ref().to_path_buf();
         let config = Qwen3TtsConfig::load(&model_dir)?;
-        let prep = CustomVoiceTextPrep::load(&model_dir)?;
+        let prep = TtsTextPrep::load(&model_dir)?;
         let runtime = HipRuntime::new(options.device)?;
         let talker = HipTalker::load(&runtime, &model_dir, options.max_cache_steps)?;
         let predictor = HipCodePredictor::load(&runtime, &model_dir)?;
@@ -367,7 +368,7 @@ impl HipTtsEngine {
     fn start_stream_with_inputs(
         &self,
         text: &str,
-        inputs: CustomVoiceInputs,
+        inputs: TtsPreparedInputs,
         options: GenerateOptions,
     ) -> Result<HipTtsStream<'_>> {
         self.check_cache_capacity(&inputs, options.max_frames)?;
@@ -439,7 +440,7 @@ impl HipTtsEngine {
         Ok(())
     }
 
-    fn check_cache_capacity(&self, inputs: &CustomVoiceInputs, max_frames: usize) -> Result<()> {
+    fn check_cache_capacity(&self, inputs: &TtsPreparedInputs, max_frames: usize) -> Result<()> {
         if inputs.prefill_steps + max_frames > self.max_cache_steps {
             return Err(Error::InvalidInput(format!(
                 "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
@@ -490,7 +491,7 @@ impl HipTtsEngine {
 
     fn rollout(
         &self,
-        inputs: &CustomVoiceInputs,
+        inputs: &TtsPreparedInputs,
         options: &GenerateOptions,
     ) -> Result<GeneratedCodes> {
         let _range = profile::range("engine.rollout");
@@ -584,7 +585,7 @@ impl HipTtsEngine {
 
     fn rollout_profiled(
         &self,
-        inputs: &CustomVoiceInputs,
+        inputs: &TtsPreparedInputs,
         options: &GenerateOptions,
         timings: &mut GenerationProfile,
     ) -> Result<GeneratedCodes> {

@@ -201,9 +201,9 @@ python-reference/.venv/bin/python scripts/qwen3-python-rtf-bench.py
 The script runs one warmup by default so measured RTF excludes first-use MIOpen and
 kernel setup costs.
 
-The repository also contains lower-level smoke, parity, and benchmark binaries for
-HIP runtime primitives, decoder stacks, graph capture, CodePredictor, talker, and
-codec debugging. They are intentionally not part of the public API.
+The repository also contains lower-level parity and benchmark binaries for active
+diagnostics. Older one-off experiments are kept out of Cargo's automatic bin build;
+see `docs/tools.md` for the supported and archived tool layout.
 
 ## Module Layout
 

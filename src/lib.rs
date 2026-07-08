@@ -68,6 +68,10 @@ pub mod text {
     pub use crate::model::text::*;
 }
 
+pub mod voice_clone {
+    pub use crate::model::voice_clone::*;
+}
+
 pub mod weights {
     pub use crate::model::weights::*;
 }

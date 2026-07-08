@@ -9,12 +9,13 @@ use tokenizers::{AddedToken, Tokenizer};
 
 use crate::config::Qwen3TtsConfig;
 use crate::error::{Error, Result};
+use crate::model::voice_clone::VoiceClonePrompt;
 use crate::weights::{TensorArchive, read_value, tensor_to_f32};
 
 const NEWLINE: u32 = 198;
 
 #[derive(Debug, Clone)]
-pub struct CustomVoiceInputs {
+pub struct TtsPreparedInputs {
     pub input_ids: Vec<u32>,
     pub content_ids: Vec<u32>,
     pub prefill: Vec<f32>,
@@ -22,47 +23,6 @@ pub struct CustomVoiceInputs {
     pub trailing_text: Vec<f32>,
     pub trailing_steps: usize,
     pub tts_pad_embed: Vec<f32>,
-}
-
-#[derive(Debug, Clone)]
-pub struct VoiceClonePrompt {
-    pub speaker_embedding: Vec<f32>,
-    pub x_vector_only_mode: bool,
-    pub icl_mode: bool,
-    pub ref_text: Option<String>,
-    pub ref_codes: Option<Vec<i32>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VoiceClonePromptJson {
-    speaker_embedding: Vec<f32>,
-    #[serde(default)]
-    x_vector_only_mode: bool,
-    #[serde(default)]
-    icl_mode: bool,
-    #[serde(default)]
-    ref_text: Option<String>,
-    #[serde(default)]
-    ref_codes: Option<Vec<i32>>,
-}
-
-impl VoiceClonePrompt {
-    pub fn from_json(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let bytes = std::fs::read(path).map_err(|err| {
-            Error::InvalidInput(format!("failed to read {}: {err}", path.display()))
-        })?;
-        let raw: VoiceClonePromptJson = serde_json::from_slice(&bytes).map_err(|err| {
-            Error::InvalidInput(format!("failed to parse {}: {err}", path.display()))
-        })?;
-        Ok(Self {
-            speaker_embedding: raw.speaker_embedding,
-            x_vector_only_mode: raw.x_vector_only_mode,
-            icl_mode: raw.icl_mode,
-            ref_text: raw.ref_text,
-            ref_codes: raw.ref_codes,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -286,7 +246,7 @@ impl TextTokenizer {
     }
 }
 
-pub struct CustomVoiceTextPrep {
+pub struct TtsTextPrep {
     config: Qwen3TtsConfig,
     tokenizer: TextTokenizer,
     text_embedding_dtype: Dtype,
@@ -303,7 +263,7 @@ pub struct CustomVoiceTextPrep {
     codec_vocab: usize,
 }
 
-impl CustomVoiceTextPrep {
+impl TtsTextPrep {
     pub fn load(model_dir: &Path) -> Result<Self> {
         let config = Qwen3TtsConfig::load(model_dir)?;
         let tokenizer = TextTokenizer::from_pretrained(model_dir)?;
@@ -373,7 +333,7 @@ impl CustomVoiceTextPrep {
         text: &str,
         speaker: Speaker,
         language: Language,
-    ) -> Result<CustomVoiceInputs> {
+    ) -> Result<TtsPreparedInputs> {
         self.prepare_custom_voice_with_lookahead(text, speaker, language, 1)
     }
 
@@ -383,7 +343,7 @@ impl CustomVoiceTextPrep {
         speaker: Speaker,
         language: Language,
         text_lookahead_tokens: usize,
-    ) -> Result<CustomVoiceInputs> {
+    ) -> Result<TtsPreparedInputs> {
         if text_lookahead_tokens == 0 {
             return Err(Error::InvalidInput(
                 "text_lookahead_tokens must be non-zero".to_string(),
@@ -410,7 +370,7 @@ impl CustomVoiceTextPrep {
         trailing.push(self.config.tokens.tts_eos as u32);
         let trailing_text = self.projected_text_embeddings(&trailing)?;
         let tts_pad_embed = self.projected_text_embeddings(&[self.config.tokens.tts_pad as u32])?;
-        Ok(CustomVoiceInputs {
+        Ok(TtsPreparedInputs {
             input_ids,
             content_ids,
             prefill_steps: prefill.len() / self.hidden,
@@ -427,7 +387,7 @@ impl CustomVoiceTextPrep {
         prompt: &VoiceClonePrompt,
         language: Language,
         text_lookahead_tokens: usize,
-    ) -> Result<CustomVoiceInputs> {
+    ) -> Result<TtsPreparedInputs> {
         if !prompt.x_vector_only_mode || prompt.icl_mode || prompt.ref_codes.is_some() {
             return Err(Error::InvalidInput(
                 "only x-vector-only voice clone prompts are supported for now".to_string(),
@@ -470,7 +430,7 @@ impl CustomVoiceTextPrep {
         trailing.push(self.config.tokens.tts_eos as u32);
         let trailing_text = self.projected_text_embeddings(&trailing)?;
         let tts_pad_embed = self.projected_text_embeddings(&[self.config.tokens.tts_pad as u32])?;
-        Ok(CustomVoiceInputs {
+        Ok(TtsPreparedInputs {
             input_ids,
             content_ids,
             prefill_steps: prefill.len() / self.hidden,

@@ -5,7 +5,7 @@ use qwen3_hip_runtime::code_predictor::HipCodePredictor;
 use qwen3_hip_runtime::codec::write_wav;
 use qwen3_hip_runtime::codec_hip::HipCodecInitial;
 use qwen3_hip_runtime::talker::HipTalker;
-use qwen3_hip_runtime::text::{CustomVoiceTextPrep, Language, Speaker};
+use qwen3_hip_runtime::text::{Language, Speaker, TtsTextPrep};
 use qwen3_hip_runtime::{DeviceBuffer, Error, HipRuntime};
 
 const CODE_GROUPS: usize = 16;
@@ -28,7 +28,7 @@ fn main() -> qwen3_hip_runtime::Result<()> {
     let language = Language::English;
 
     let load_start = Instant::now();
-    let prep = CustomVoiceTextPrep::load(&model_dir)?;
+    let prep = TtsTextPrep::load(&model_dir)?;
     let inputs = prep.prepare_custom_voice(&text, speaker, language)?;
     let runtime = HipRuntime::new(0)?;
     let talker = HipTalker::load(&runtime, &model_dir, inputs.prefill_steps + max_frames)?;
