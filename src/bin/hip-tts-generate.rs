@@ -7,7 +7,7 @@ use qwen3_hip_runtime::generation::{
     DEFAULT_TEXT_LOOKAHEAD_TOKENS, GenerateOptions, HipTtsEngine, Language, Speaker, StreamOptions,
     VoiceClonePrompt,
 };
-use qwen3_hip_runtime::{Error, Result};
+use qwen3_hip_runtime::{EngineOptions, Error, Result};
 
 const CODE_GROUPS: usize = 16;
 
@@ -61,6 +61,7 @@ fn main() -> Result<()> {
         let text = value.to_string_lossy();
         (!matches!(text.as_ref(), "none" | "-")).then(|| PathBuf::from(value))
     });
+    let initial_cache_steps = parse_arg(args.next(), "initial_cache_steps")?;
     if max_frames == 0 {
         return Err(Error::InvalidInput(
             "max_frames must be non-zero".to_string(),
@@ -73,7 +74,17 @@ fn main() -> Result<()> {
     }
 
     let load_start = Instant::now();
-    let engine = HipTtsEngine::load_with_max_frames(&model_dir, 0, max_frames)?;
+    let engine = if let Some(max_cache_steps) = initial_cache_steps {
+        HipTtsEngine::load_with_options(
+            &model_dir,
+            EngineOptions {
+                device: 0,
+                max_cache_steps,
+            },
+        )?
+    } else {
+        HipTtsEngine::load_with_max_frames(&model_dir, 0, max_frames)?
+    };
     engine.runtime().synchronize()?;
     let load_seconds = load_start.elapsed().as_secs_f64();
 

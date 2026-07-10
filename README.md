@@ -74,8 +74,10 @@ fn main() -> qwen3_hip_runtime::Result<()> {
 }
 ```
 
-If you need a fixed KV-cache capacity independent of a single request's frame cap,
-use `HipTtsEngine::load_with_options(...)` and set `EngineOptions::max_cache_steps`.
+`EngineOptions::max_cache_steps` sets the initial Talker KV-cache capacity. The cache
+grows geometrically as prefill or generation exceeds that size, preserving the full
+attention history. Set a larger initial value to avoid occasional reallocation pauses
+on long requests.
 
 Useful generation options:
 
@@ -121,7 +123,8 @@ Rust generation against the exported `.npy` using `text_lookahead_tokens=1`.
 The std-only HTTP demo server also supports the same precomputed x-vector prompt.
 Start `tts-server` with the Base model and pass the prompt JSON as the optional fourth
 argument. The browser UI then exposes a voice-mode selector for both WAV generation
-and PCM streaming.
+and PCM streaming. `Output frames` is a per-request safety ceiling, independent of
+the growable KV cache; set it high for a long request.
 
 For incremental generation, create a persistent stream and pull code or audio chunks:
 

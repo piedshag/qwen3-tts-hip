@@ -3,6 +3,31 @@
 Running notes for performance work on the HIP runtime. Keep entries factual:
 what changed, how it was measured, and what we learned.
 
+## 2026-07-10
+
+### Growable Talker KV Cache
+
+Replaced the fixed Talker KV-cache limit with geometrically growing device buffers.
+When a prefill or decode step exceeds capacity, the runtime synchronizes, allocates a
+larger per-layer KV cache and matching attention workspace, copies existing K/V values,
+then continues at the same absolute position. This preserves all previous attention
+context rather than evicting it.
+
+Measured with cached 0.6B CustomVoice, greedy semantic/acoustic generation,
+`initial_cache_steps=16`, and `max_frames=24`. The request completed without a
+cache-capacity error after growth during prefill and decode, and its WAV output was
+byte-identical to the same request using the normal initial cache allocation.
+
+```text
+frames=24
+ended_by_eos=false
+generation_seconds=0.979648
+```
+
+Discovery: the initial cache size is now a latency/memory tradeoff instead of a hard
+generation limit. Larger initial capacities avoid reallocation pauses for known-long
+requests.
+
 ## 2026-07-02
 
 ### Base X-Vector Voice Clone Smoke

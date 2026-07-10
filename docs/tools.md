@@ -8,6 +8,8 @@ Cargo does not build every historical experiment during normal checks.
 
 - `tts-server`: std-only HTTP demo server for WAV generation and PCM streaming.
 - `hip-tts-generate`: command-line generation, WAV writing, and code parity helper.
+  Its optional final `initial_cache_steps` argument forces a small starting Talker
+  cache to exercise growth.
 - `hip-engine-bench`: public `HipTtsEngine` benchmark with generation and decode RTF.
 - `hip-engine-profile`: stage/GEMM-shape profiler for the public engine path.
 - `hip-stream-bench`: chunk-by-chunk streaming latency and RTF diagnostic.

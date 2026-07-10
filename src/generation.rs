@@ -137,7 +137,6 @@ pub struct HipTtsEngine {
     talker: HipTalker,
     predictor: HipCodePredictor,
     codec: HipCodecInitial,
-    max_cache_steps: usize,
     code_groups: usize,
     codec_eos_token: i32,
 }
@@ -308,7 +307,6 @@ impl HipTtsEngine {
             talker,
             predictor,
             codec,
-            max_cache_steps: options.max_cache_steps,
             code_groups: config.talker.num_code_groups,
             codec_eos_token: config.tokens.codec_eos as i32,
         })
@@ -365,7 +363,6 @@ impl HipTtsEngine {
                 usize::MAX,
             )?
         };
-        self.check_cache_capacity(&inputs, options.max_frames)?;
         let codes = self.rollout(&inputs, &options)?;
         Ok(codes)
     }
@@ -387,7 +384,6 @@ impl HipTtsEngine {
                 usize::MAX,
             )?
         };
-        self.check_cache_capacity(&inputs, options.max_frames)?;
         let codes = self.rollout(&inputs, &options)?;
         Ok(codes)
     }
@@ -409,8 +405,6 @@ impl HipTtsEngine {
             usize::MAX,
         )?;
         timings.prepare_text_seconds = start.elapsed().as_secs_f64();
-        self.check_cache_capacity(&inputs, options.max_frames)?;
-
         let codes = self.rollout_profiled(&inputs, &options, &mut timings)?;
         Ok(ProfiledGeneratedCodes {
             codes,
@@ -517,7 +511,6 @@ impl HipTtsEngine {
         options: GenerateOptions,
         stream_options: StreamOptions,
     ) -> Result<HipTtsStream<'_>> {
-        self.check_cache_capacity(&inputs, options.max_frames)?;
         let talker_sampling = options.talker_sampling();
         let subtalker_sampling = options.subtalker_sampling();
         let mut rng_state = options.seed ^ 0x9e37_79b9_7f4a_7c15;
@@ -601,17 +594,6 @@ impl HipTtsEngine {
             return Err(Error::InvalidInput(
                 "min_resume_tokens must be non-zero".to_string(),
             ));
-        }
-        Ok(())
-    }
-
-    fn check_cache_capacity(&self, inputs: &TtsPreparedInputs, max_frames: usize) -> Result<()> {
-        if inputs.prefill_steps + max_frames > self.max_cache_steps {
-            return Err(Error::InvalidInput(format!(
-                "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
-                inputs.prefill_steps + max_frames,
-                self.max_cache_steps
-            )));
         }
         Ok(())
     }
@@ -1315,14 +1297,6 @@ impl<'a> PollingTextStream<'a> {
             )?
         };
         let prefill_steps = prefill.len() / self.engine.talker.hidden_size();
-        if prefill_steps + self.options.max_frames > self.engine.max_cache_steps {
-            return Err(Error::InvalidInput(format!(
-                "requested {} cache steps but engine was loaded for {}; call load_with_max_frames with a larger max_frames",
-                prefill_steps + self.options.max_frames,
-                self.engine.max_cache_steps
-            )));
-        }
-
         let talker_sampling = self.options.talker_sampling();
         let subtalker_sampling = self.options.subtalker_sampling();
         let mut rng_state = self.options.seed ^ 0x9e37_79b9_7f4a_7c15;

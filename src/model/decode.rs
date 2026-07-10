@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::Path;
 use std::time::Instant;
@@ -82,15 +83,20 @@ pub struct DecodeStepLayer {
 }
 
 pub struct DecodeStepStack {
-    dims: DecodeStepDims,
     weights: Vec<DecodeDeviceWeights>,
-    caches: Vec<DecodeLayerCache>,
     blas: RocblasHandle,
     kernels: DecodeKernels,
+    runtime: HipRuntime,
+    storage: RefCell<DecodeCacheStorage>,
+    current_scratch: DeviceBuffer<f32>,
+}
+
+struct DecodeCacheStorage {
+    dims: DecodeStepDims,
+    caches: Vec<DecodeLayerCache>,
     workspace: DecodeWorkspace,
     prefix_a: DeviceBuffer<f32>,
     prefix_b: DeviceBuffer<f32>,
-    current_scratch: DeviceBuffer<f32>,
 }
 
 struct DecodeHostWeights {
@@ -799,77 +805,126 @@ impl DecodeStepStack {
             }
             Ok((weights, caches, dims.expect("layer count checked above")))
         })?;
-        Ok(Self {
+        let storage = DecodeCacheStorage {
             dims,
-            weights,
             caches,
-            blas: runtime.create_blas_handle()?,
-            kernels: DecodeKernels::compile(runtime)?,
             workspace: DecodeWorkspace::new(runtime, dims)?,
             prefix_a: runtime.empty_buffer::<f32>(max_cache_steps * dims.hidden)?,
             prefix_b: runtime.empty_buffer::<f32>(max_cache_steps * dims.hidden)?,
+        };
+        Ok(Self {
+            weights,
+            blas: runtime.create_blas_handle()?,
+            kernels: DecodeKernels::compile(runtime)?,
+            runtime: runtime.clone(),
+            storage: RefCell::new(storage),
             current_scratch: runtime.empty_buffer::<f32>(dims.hidden)?,
         })
     }
 
+    fn ensure_cache_capacity(&self, required_steps: usize) -> Result<()> {
+        let current_steps = self.storage.borrow().dims.max_cache_steps;
+        if required_steps <= current_steps {
+            return Ok(());
+        }
+        let target_steps = next_cache_capacity(current_steps, required_steps)?;
+        self.runtime.synchronize()?;
+
+        let current = self.storage.borrow();
+        let mut dims = current.dims;
+        dims.max_cache_steps = target_steps;
+        let mut caches = Vec::with_capacity(current.caches.len());
+        for cache in &current.caches {
+            let expanded = DecodeLayerCache::new(&self.runtime, dims)?;
+            copy_cache_heads(&expanded.k_cache, &cache.k_cache, current.dims, dims)?;
+            copy_cache_heads(&expanded.v_cache, &cache.v_cache, current.dims, dims)?;
+            caches.push(expanded);
+        }
+        let prefix_len = target_steps
+            .checked_mul(dims.hidden)
+            .ok_or_else(|| Error::InvalidInput("prefix buffer size overflow".to_string()))?;
+        let replacement = DecodeCacheStorage {
+            dims,
+            caches,
+            workspace: DecodeWorkspace::new(&self.runtime, dims)?,
+            prefix_a: self.runtime.empty_buffer::<f32>(prefix_len)?,
+            prefix_b: self.runtime.empty_buffer::<f32>(prefix_len)?,
+        };
+        drop(current);
+        *self.storage.borrow_mut() = replacement;
+        Ok(())
+    }
+
     pub fn copy_prefill_step_to(&self, output: &DeviceBuffer<f32>, step: usize) -> Result<()> {
-        if output.len() != self.dims.hidden {
+        let storage = self.storage.borrow();
+        if output.len() != storage.dims.hidden {
             return Err(Error::InvalidInput(format!(
                 "prefill step output length must be {}, got {}",
-                self.dims.hidden,
+                storage.dims.hidden,
                 output.len()
             )));
         }
-        if step >= self.dims.max_cache_steps {
+        if step >= storage.dims.max_cache_steps {
             return Err(Error::InvalidInput(format!(
                 "prefill step {step} outside cache length {}",
-                self.dims.max_cache_steps
+                storage.dims.max_cache_steps
             )));
         }
         let source = if (self.weights.len() - 1) % 2 == 0 {
-            &self.prefix_a
+            &storage.prefix_a
         } else {
-            &self.prefix_b
+            &storage.prefix_b
         };
-        output.copy_from_device_range(source, step * self.dims.hidden, self.dims.hidden)
+        output.copy_from_device_range(source, step * storage.dims.hidden, storage.dims.hidden)
     }
 
     pub fn dims(&self) -> DecodeStepDims {
-        self.dims
+        self.storage.borrow().dims
     }
 
     pub fn input_len(&self) -> usize {
-        self.dims.hidden
+        self.storage.borrow().dims.hidden
     }
 
     pub fn prefill(&self, prefix: &DeviceBuffer<f32>, prefix_steps: usize) -> Result<()> {
-        if prefix_steps == 0 || prefix_steps > self.dims.max_cache_steps {
+        if prefix_steps == 0 {
             return Err(Error::InvalidInput(format!(
-                "prefix steps {prefix_steps} outside 1..={}",
-                self.dims.max_cache_steps
+                "prefix steps must be non-zero, got {prefix_steps}"
             )));
         }
-        if prefix.len() < prefix_steps * self.dims.hidden {
+        self.ensure_cache_capacity(prefix_steps)?;
+        let storage = self.storage.borrow();
+        if prefix.len() < prefix_steps * storage.dims.hidden {
             return Err(Error::InvalidInput(format!(
                 "prefix length {} is smaller than {}",
                 prefix.len(),
-                prefix_steps * self.dims.hidden
+                prefix_steps * storage.dims.hidden
             )));
         }
 
-        for (index, (weights, cache)) in self.weights.iter().zip(self.caches.iter()).enumerate() {
+        for (index, (weights, cache)) in self.weights.iter().zip(storage.caches.iter()).enumerate()
+        {
             match index {
-                0 => self.prefill_forward(prefix, &self.prefix_a, weights, cache, prefix_steps)?,
+                0 => self.prefill_forward(
+                    &storage,
+                    prefix,
+                    &storage.prefix_a,
+                    weights,
+                    cache,
+                    prefix_steps,
+                )?,
                 index if index % 2 == 1 => self.prefill_forward(
-                    &self.prefix_a,
-                    &self.prefix_b,
+                    &storage,
+                    &storage.prefix_a,
+                    &storage.prefix_b,
                     weights,
                     cache,
                     prefix_steps,
                 )?,
                 _ => self.prefill_forward(
-                    &self.prefix_b,
-                    &self.prefix_a,
+                    &storage,
+                    &storage.prefix_b,
+                    &storage.prefix_a,
                     weights,
                     cache,
                     prefix_steps,
@@ -886,43 +941,47 @@ impl DecodeStepStack {
         offset: usize,
         stream: &HipStream,
     ) -> Result<()> {
-        if input.len() != self.dims.hidden || output.len() != self.dims.hidden {
+        let storage = self.storage.borrow();
+        if input.len() != storage.dims.hidden || output.len() != storage.dims.hidden {
             return Err(Error::InvalidInput(format!(
                 "decode input/output length must be {}, got input={}, output={}",
-                self.dims.hidden,
+                storage.dims.hidden,
                 input.len(),
                 output.len()
             )));
         }
-        if offset >= self.dims.max_cache_steps {
+        if offset >= storage.dims.max_cache_steps {
             return Err(Error::InvalidInput(format!(
                 "offset {offset} outside cache length {}",
-                self.dims.max_cache_steps
+                storage.dims.max_cache_steps
             )));
         }
         if self.weights.len() == 1 {
             return self.decode_step_layer_on_stream(
+                &storage,
                 input,
                 output,
                 &self.weights[0],
-                &self.caches[0],
+                &storage.caches[0],
                 offset,
                 stream,
             );
         }
 
         self.decode_step_layer_on_stream(
+            &storage,
             input,
             &self.current_scratch,
             &self.weights[0],
-            &self.caches[0],
+            &storage.caches[0],
             offset,
             stream,
         )?;
         let mut current_is_scratch = true;
-        for (weights, cache) in self.weights.iter().zip(self.caches.iter()).skip(1) {
+        for (weights, cache) in self.weights.iter().zip(storage.caches.iter()).skip(1) {
             if current_is_scratch {
                 self.decode_step_layer_on_stream(
+                    &storage,
                     &self.current_scratch,
                     output,
                     weights,
@@ -932,6 +991,7 @@ impl DecodeStepStack {
                 )?;
             } else {
                 self.decode_step_layer_on_stream(
+                    &storage,
                     output,
                     &self.current_scratch,
                     weights,
@@ -954,43 +1014,58 @@ impl DecodeStepStack {
         output: &DeviceBuffer<f32>,
         offset: usize,
     ) -> Result<()> {
-        if input.len() != self.dims.hidden || output.len() != self.dims.hidden {
+        let required_steps = offset
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("cache position overflow".to_string()))?;
+        self.ensure_cache_capacity(required_steps)?;
+        let storage = self.storage.borrow();
+        if input.len() != storage.dims.hidden || output.len() != storage.dims.hidden {
             return Err(Error::InvalidInput(format!(
                 "decode input/output length must be {}, got input={}, output={}",
-                self.dims.hidden,
+                storage.dims.hidden,
                 input.len(),
                 output.len()
             )));
         }
-        if offset >= self.dims.max_cache_steps {
-            return Err(Error::InvalidInput(format!(
-                "offset {offset} outside cache length {}",
-                self.dims.max_cache_steps
-            )));
-        }
         if self.weights.len() == 1 {
             return self.decode_step_layer(
+                &storage,
                 input,
                 output,
                 &self.weights[0],
-                &self.caches[0],
+                &storage.caches[0],
                 offset,
             );
         }
 
         self.decode_step_layer(
+            &storage,
             input,
             &self.current_scratch,
             &self.weights[0],
-            &self.caches[0],
+            &storage.caches[0],
             offset,
         )?;
         let mut current_is_scratch = true;
-        for (weights, cache) in self.weights.iter().zip(self.caches.iter()).skip(1) {
+        for (weights, cache) in self.weights.iter().zip(storage.caches.iter()).skip(1) {
             if current_is_scratch {
-                self.decode_step_layer(&self.current_scratch, output, weights, cache, offset)?;
+                self.decode_step_layer(
+                    &storage,
+                    &self.current_scratch,
+                    output,
+                    weights,
+                    cache,
+                    offset,
+                )?;
             } else {
-                self.decode_step_layer(output, &self.current_scratch, weights, cache, offset)?;
+                self.decode_step_layer(
+                    &storage,
+                    output,
+                    &self.current_scratch,
+                    weights,
+                    cache,
+                    offset,
+                )?;
             }
             current_is_scratch = !current_is_scratch;
         }
@@ -1007,45 +1082,47 @@ impl DecodeStepStack {
         output: &DeviceBuffer<f32>,
         offset: usize,
     ) -> Result<DecodeStepProfile> {
-        if input.len() != self.dims.hidden || output.len() != self.dims.hidden {
+        let required_steps = offset
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidInput("cache position overflow".to_string()))?;
+        self.ensure_cache_capacity(required_steps)?;
+        let storage = self.storage.borrow();
+        if input.len() != storage.dims.hidden || output.len() != storage.dims.hidden {
             return Err(Error::InvalidInput(format!(
                 "decode input/output length must be {}, got input={}, output={}",
-                self.dims.hidden,
+                storage.dims.hidden,
                 input.len(),
                 output.len()
-            )));
-        }
-        if offset >= self.dims.max_cache_steps {
-            return Err(Error::InvalidInput(format!(
-                "offset {offset} outside cache length {}",
-                self.dims.max_cache_steps
             )));
         }
         let mut profile = DecodeStepProfile::default();
         if self.weights.len() == 1 {
             profile.add(&self.decode_step_layer_profiled(
+                &storage,
                 runtime,
                 input,
                 output,
                 &self.weights[0],
-                &self.caches[0],
+                &storage.caches[0],
                 offset,
             )?);
             return Ok(profile);
         }
 
         profile.add(&self.decode_step_layer_profiled(
+            &storage,
             runtime,
             input,
             &self.current_scratch,
             &self.weights[0],
-            &self.caches[0],
+            &storage.caches[0],
             offset,
         )?);
         let mut current_is_scratch = true;
-        for (weights, cache) in self.weights.iter().zip(self.caches.iter()).skip(1) {
+        for (weights, cache) in self.weights.iter().zip(storage.caches.iter()).skip(1) {
             if current_is_scratch {
                 profile.add(&self.decode_step_layer_profiled(
+                    &storage,
                     runtime,
                     &self.current_scratch,
                     output,
@@ -1055,6 +1132,7 @@ impl DecodeStepStack {
                 )?);
             } else {
                 profile.add(&self.decode_step_layer_profiled(
+                    &storage,
                     runtime,
                     output,
                     &self.current_scratch,
@@ -1076,14 +1154,15 @@ impl DecodeStepStack {
 
     fn prefill_forward(
         &self,
+        storage: &DecodeCacheStorage,
         prefix: &DeviceBuffer<f32>,
         output: &DeviceBuffer<f32>,
         weights: &DecodeDeviceWeights,
         cache: &DecodeLayerCache,
         prefix_steps: usize,
     ) -> Result<()> {
-        let d = self.dims;
-        let w = &self.workspace;
+        let d = storage.dims;
+        let w = &storage.workspace;
         let k = &self.kernels;
         launch_rmsnorm(
             &k.rmsnorm,
@@ -1299,14 +1378,15 @@ impl DecodeStepStack {
 
     fn decode_step_layer(
         &self,
+        storage: &DecodeCacheStorage,
         input: &DeviceBuffer<f32>,
         output: &DeviceBuffer<f32>,
         weights: &DecodeDeviceWeights,
         cache: &DecodeLayerCache,
         offset: usize,
     ) -> Result<()> {
-        let d = self.dims;
-        let w = &self.workspace;
+        let d = storage.dims;
+        let w = &storage.workspace;
         let k = &self.kernels;
         let active_steps = offset + 1;
         launch_rmsnorm(
@@ -1476,6 +1556,7 @@ impl DecodeStepStack {
 
     fn decode_step_layer_profiled(
         &self,
+        storage: &DecodeCacheStorage,
         runtime: &HipRuntime,
         input: &DeviceBuffer<f32>,
         output: &DeviceBuffer<f32>,
@@ -1483,8 +1564,8 @@ impl DecodeStepStack {
         cache: &DecodeLayerCache,
         offset: usize,
     ) -> Result<DecodeStepProfile> {
-        let d = self.dims;
-        let w = &self.workspace;
+        let d = storage.dims;
+        let w = &storage.workspace;
         let k = &self.kernels;
         let active_steps = offset + 1;
         let mut profile = DecodeStepProfile::default();
@@ -1693,6 +1774,7 @@ impl DecodeStepStack {
 
     fn decode_step_layer_on_stream(
         &self,
+        storage: &DecodeCacheStorage,
         input: &DeviceBuffer<f32>,
         output: &DeviceBuffer<f32>,
         weights: &DecodeDeviceWeights,
@@ -1700,8 +1782,8 @@ impl DecodeStepStack {
         offset: usize,
         stream: &HipStream,
     ) -> Result<()> {
-        let d = self.dims;
-        let w = &self.workspace;
+        let d = storage.dims;
+        let w = &storage.workspace;
         let k = &self.kernels;
         let active_steps = offset + 1;
         launch_rmsnorm_on_stream(
@@ -1891,6 +1973,75 @@ impl DecodeStepStack {
             d.hidden,
             Some(stream),
         )
+    }
+}
+
+fn copy_cache_heads(
+    destination: &DeviceBuffer<f32>,
+    source: &DeviceBuffer<f32>,
+    source_dims: DecodeStepDims,
+    destination_dims: DecodeStepDims,
+) -> Result<()> {
+    if source_dims.kv_heads != destination_dims.kv_heads
+        || source_dims.head_dim != destination_dims.head_dim
+        || source_dims.max_cache_steps > destination_dims.max_cache_steps
+    {
+        return Err(Error::InvalidInput(
+            "invalid KV-cache growth dimensions".to_string(),
+        ));
+    }
+    let source_head_len = source_dims
+        .max_cache_steps
+        .checked_mul(source_dims.head_dim)
+        .ok_or_else(|| Error::InvalidInput("KV-cache head size overflow".to_string()))?;
+    let destination_head_len = destination_dims
+        .max_cache_steps
+        .checked_mul(destination_dims.head_dim)
+        .ok_or_else(|| Error::InvalidInput("KV-cache head size overflow".to_string()))?;
+    for head in 0..source_dims.kv_heads {
+        destination.copy_from_device_range_at(
+            head * destination_head_len,
+            source,
+            head * source_head_len,
+            source_head_len,
+        )?;
+    }
+    Ok(())
+}
+
+fn next_cache_capacity(current_steps: usize, required_steps: usize) -> Result<usize> {
+    if current_steps == 0 {
+        return Err(Error::InvalidInput(
+            "cache capacity must be non-zero".to_string(),
+        ));
+    }
+    if required_steps <= current_steps {
+        return Ok(current_steps);
+    }
+    let doubled = current_steps.checked_mul(2).unwrap_or(required_steps);
+    if required_steps <= doubled {
+        Ok(doubled)
+    } else {
+        Ok(required_steps
+            .checked_next_power_of_two()
+            .unwrap_or(required_steps))
+    }
+}
+
+#[cfg(test)]
+mod cache_growth_tests {
+    use super::*;
+
+    #[test]
+    fn cache_capacity_doubles_until_it_covers_required_steps() {
+        assert_eq!(next_cache_capacity(16, 16).unwrap(), 16);
+        assert_eq!(next_cache_capacity(16, 17).unwrap(), 32);
+        assert_eq!(next_cache_capacity(16, 33).unwrap(), 64);
+    }
+
+    #[test]
+    fn cache_capacity_rejects_zero_initial_size() {
+        assert!(next_cache_capacity(0, 1).is_err());
     }
 }
 

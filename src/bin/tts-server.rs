@@ -336,11 +336,10 @@ fn parse_generation_request(state: &ServerState, request: &Request) -> Result<Ge
         .map(|value| parse_usize(value, "max_frames"))
         .transpose()?
         .unwrap_or(120);
-    if max_frames == 0 || max_frames > state.max_cache_frames {
-        return Err(Error::InvalidInput(format!(
-            "max_frames must be in 1..={} for this server",
-            state.max_cache_frames
-        )));
+    if max_frames == 0 {
+        return Err(Error::InvalidInput(
+            "max_frames must be non-zero".to_string(),
+        ));
     }
     let speaker = form
         .get("speaker")
@@ -686,7 +685,7 @@ fn index_html(state: &ServerState) -> String {
   <p>Small standard-library HTTP server around <code>HipTtsEngine</code>. It returns WAV audio and reports generation timing and RTF from response headers.</p>
   <div class="meta">
     <span class="pill">model load: {load_seconds:.3}s</span>
-    <span class="pill">max cache frames: {max_cache_frames}</span>
+    <span class="pill">initial cache frames: {max_cache_frames}</span>
     <span class="pill">sample rate: {sample_rate} Hz</span>
     <span class="pill">voice clone prompt: {voice_clone_prompt_status}</span>
   </div>
@@ -701,8 +700,8 @@ fn index_html(state: &ServerState) -> String {
           <option value="stream">Stream PCM</option>
         </select>
       </label>
-      <label>Frames
-        <input name="max_frames" type="number" min="1" max="{max_cache_frames}" value="120">
+      <label>Output frames
+        <input name="max_frames" type="number" min="1" value="120">
       </label>
       <label id="speaker-field">Speaker
         <select name="speaker">
