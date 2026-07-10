@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 use crate::audio::codec_hip::HipCodecInitial;
@@ -162,6 +163,17 @@ pub struct HipTtsStream<'a> {
 }
 
 pub struct HipTextStream<'a> {
+    stream: PollingTextStream<'a>,
+    input: Receiver<TextStreamInputMessage>,
+    finished_codes: Option<GeneratedCodes>,
+}
+
+pub struct TextStreamInput {
+    sender: Sender<TextStreamInputMessage>,
+    finished: bool,
+}
+
+pub struct PollingTextStream<'a> {
     engine: &'a HipTtsEngine,
     options: GenerateOptions,
     stream_options: TextStreamOptions,
@@ -173,6 +185,11 @@ pub struct HipTextStream<'a> {
     eos_consumed: bool,
     state: Option<HipTextStreamState>,
     finished_codes: Option<GeneratedCodes>,
+}
+
+enum TextStreamInputMessage {
+    Text(String),
+    Finish,
 }
 
 struct HipTextStreamState {
@@ -448,11 +465,21 @@ impl HipTtsEngine {
         &self,
         options: GenerateOptions,
         stream_options: TextStreamOptions,
-    ) -> Result<HipTextStream<'_>> {
+    ) -> Result<(TextStreamInput, HipTextStream<'_>)> {
         let _range = profile::range("engine.start_text_stream");
+        let stream = self.start_text_stream_polling(options, stream_options)?;
+        Ok(HipTextStream::from_polling(stream))
+    }
+
+    pub fn start_text_stream_polling(
+        &self,
+        options: GenerateOptions,
+        stream_options: TextStreamOptions,
+    ) -> Result<PollingTextStream<'_>> {
+        let _range = profile::range("engine.start_text_stream_polling");
         Self::validate_generate_options(&options)?;
         Self::validate_text_stream_options(&stream_options)?;
-        Ok(HipTextStream::new(self, options, stream_options, None))
+        Ok(PollingTextStream::new(self, options, stream_options, None))
     }
 
     pub fn start_voice_clone_text_stream(
@@ -460,11 +487,22 @@ impl HipTtsEngine {
         prompt: &VoiceClonePrompt,
         options: GenerateOptions,
         stream_options: TextStreamOptions,
-    ) -> Result<HipTextStream<'_>> {
+    ) -> Result<(TextStreamInput, HipTextStream<'_>)> {
         let _range = profile::range("engine.start_voice_clone_text_stream");
+        let stream = self.start_voice_clone_text_stream_polling(prompt, options, stream_options)?;
+        Ok(HipTextStream::from_polling(stream))
+    }
+
+    pub fn start_voice_clone_text_stream_polling(
+        &self,
+        prompt: &VoiceClonePrompt,
+        options: GenerateOptions,
+        stream_options: TextStreamOptions,
+    ) -> Result<PollingTextStream<'_>> {
+        let _range = profile::range("engine.start_voice_clone_text_stream_polling");
         Self::validate_generate_options(&options)?;
         Self::validate_text_stream_options(&stream_options)?;
-        Ok(HipTextStream::new(
+        Ok(PollingTextStream::new(
             self,
             options,
             stream_options,
@@ -963,13 +1001,95 @@ impl HipTtsStream<'_> {
     }
 }
 
+impl TextStreamInput {
+    pub fn push_text(&mut self, text: impl Into<String>) -> Result<()> {
+        if self.finished {
+            return Err(Error::InvalidInput(
+                "cannot push text after finish".to_string(),
+            ));
+        }
+        let text = text.into();
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.sender
+            .send(TextStreamInputMessage::Text(text))
+            .map_err(|_| {
+                Error::InvalidInput("text stream is no longer receiving input".to_string())
+            })
+    }
+
+    pub fn finish(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        self.sender
+            .send(TextStreamInputMessage::Finish)
+            .map_err(|_| {
+                Error::InvalidInput("text stream is no longer receiving input".to_string())
+            })
+    }
+}
+
+impl Drop for TextStreamInput {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.sender.send(TextStreamInputMessage::Finish);
+        }
+    }
+}
+
 impl<'a> HipTextStream<'a> {
+    fn from_polling(stream: PollingTextStream<'a>) -> (TextStreamInput, Self) {
+        let (sender, input) = mpsc::channel();
+        (
+            TextStreamInput {
+                sender,
+                finished: false,
+            },
+            Self {
+                stream,
+                input,
+                finished_codes: None,
+            },
+        )
+    }
+
+    pub fn next_audio_chunk(
+        &mut self,
+        max_chunk_frames: usize,
+    ) -> Result<Option<GeneratedAudioChunk>> {
+        if self.finished_codes.is_some() {
+            return Ok(None);
+        }
+        loop {
+            match self.stream.next_audio_chunk(max_chunk_frames)? {
+                IncrementalAudio::Chunk(chunk) => return Ok(Some(chunk)),
+                IncrementalAudio::Finished(codes) => {
+                    self.finished_codes = Some(codes);
+                    return Ok(None);
+                }
+                IncrementalAudio::NeedMoreText => match self.input.recv() {
+                    Ok(TextStreamInputMessage::Text(text)) => self.stream.push_text(&text)?,
+                    Ok(TextStreamInputMessage::Finish) | Err(_) => self.stream.finish_text()?,
+                },
+            }
+        }
+    }
+
+    pub fn finished_codes(&self) -> Option<&GeneratedCodes> {
+        self.finished_codes.as_ref()
+    }
+}
+
+impl<'a> PollingTextStream<'a> {
     fn new(
         engine: &'a HipTtsEngine,
         options: GenerateOptions,
         stream_options: TextStreamOptions,
         voice_clone_prompt: Option<VoiceClonePrompt>,
-    ) -> HipTextStream<'a> {
+    ) -> PollingTextStream<'a> {
         Self {
             engine,
             options,
@@ -1328,6 +1448,47 @@ fn stable_prefix_len(text: &str, flush_on_punctuation: bool) -> Option<usize> {
 
 fn is_sentence_boundary(ch: char) -> bool {
     matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '\n')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_stream_input_sends_text_then_finish() {
+        let (sender, receiver) = mpsc::channel();
+        let mut input = TextStreamInput {
+            sender,
+            finished: false,
+        };
+
+        input.push_text("hello").unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            TextStreamInputMessage::Text(text) if text == "hello"
+        ));
+        input.finish().unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            TextStreamInputMessage::Finish
+        ));
+        assert!(input.push_text("again").is_err());
+    }
+
+    #[test]
+    fn dropping_text_stream_input_finishes_input() {
+        let (sender, receiver) = mpsc::channel();
+        let input = TextStreamInput {
+            sender,
+            finished: false,
+        };
+
+        drop(input);
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            TextStreamInputMessage::Finish
+        ));
+    }
 }
 
 impl GenerateOptions {

@@ -82,8 +82,8 @@ pub use error::{Error, Result};
 pub use generation::{
     EngineOptions, GenerateOptions, GeneratedAudioChunk, GeneratedCodes, GeneratedCodesChunk,
     GeneratedSpeech, GenerationProfile, HipTextStream, HipTtsEngine, HipTtsStream,
-    IncrementalAudio, Language, ProfiledGeneratedCodes, Speaker, StreamOptions, TextStreamOptions,
-    VoiceClonePrompt,
+    IncrementalAudio, Language, PollingTextStream, ProfiledGeneratedCodes, Speaker, StreamOptions,
+    TextStreamInput, TextStreamOptions, VoiceClonePrompt,
 };
 pub use graph::{HipGraph, HipGraphExec, HipStream};
 pub use kernel::{HipFunction, HipModule};

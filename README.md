@@ -144,34 +144,35 @@ fn main() -> qwen3_hip_runtime::Result<()> {
 }
 ```
 
-For incoming text from an LLM or another producer, use the incremental text stream.
-It returns `NeedMoreText` when generation should pause until more text arrives:
+For incoming text from an LLM or another producer, use the channel-backed text stream.
+`next_audio_chunk` blocks until audio is available or the text input finishes:
 
 ```rust,no_run
-use qwen3_hip_runtime::{GenerateOptions, HipTtsEngine, IncrementalAudio, TextStreamOptions};
+use qwen3_hip_runtime::{GenerateOptions, HipTtsEngine, TextStreamOptions};
 
 fn main() -> qwen3_hip_runtime::Result<()> {
     let engine = HipTtsEngine::load_with_max_frames("/path/to/model", 0, 240)?;
-    let mut stream = engine.start_text_stream(
+    let (mut input, mut stream) = engine.start_text_stream(
         GenerateOptions::default(),
         TextStreamOptions::default(),
     )?;
 
-    stream.push_text("The model begins speaking ")?;
-    stream.push_text("as text chunks arrive.")?;
-    stream.finish_text()?;
+    input.push_text("The model begins speaking ")?;
+    input.push_text("as text chunks arrive.")?;
+    input.finish()?;
 
-    loop {
-        match stream.next_audio_chunk(12)? {
-            IncrementalAudio::Chunk(chunk) => println!("{} samples", chunk.samples.len()),
-            IncrementalAudio::NeedMoreText => break,
-            IncrementalAudio::Finished(_) => break,
-        }
+    while let Some(chunk) = stream.next_audio_chunk(12)? {
+        println!("{} samples", chunk.samples.len());
     }
 
     Ok(())
 }
 ```
+
+Send text from another thread or task while the consumer pulls audio. Dropping the
+`TextStreamInput` also finishes the input. For event loops that need polling rather
+than blocking behavior, use `start_text_stream_polling(...)`; its
+`PollingTextStream::next_audio_chunk(...)` returns `IncrementalAudio`.
 
 ## Python Parity Fixtures
 
